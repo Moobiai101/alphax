@@ -65,17 +65,19 @@ export function EngineProvider({
   const [isInitializing, setIsInitializing] = useState(true);
   const [error, setError] = useState<Error | null>(null);
   const [isSupported, setIsSupported] = useState<boolean>(true);
-  const initializationAttempted = useRef(false);
+  const engineRef = useRef<EngineAPI | null>(null);
 
   // Initialize engine
   useEffect(() => {
-    // Prevent multiple initialization attempts
-    if (initializationAttempted.current) {
+    // If we already have an engine instance in the ref, use it
+    // This handles React Strict Mode double-mount
+    if (engineRef.current) {
+      setEngine(engineRef.current);
+      setIsInitializing(false);
       return;
     }
-    initializationAttempted.current = true;
 
-    let engineInstance: EngineAPI | null = null;
+    let isMounted = true;
 
     const initializeEngine = async () => {
       try {
@@ -98,17 +100,27 @@ export function EngineProvider({
         };
 
         // Create engine instance
-        engineInstance = createEngine(config);
-        setEngine(engineInstance);
+        const newEngine = createEngine(config);
+        
+        if (!isMounted) {
+          // Component unmounted during initialization - destroy the engine
+          newEngine.destroy();
+          return;
+        }
+        
+        engineRef.current = newEngine;
+        setEngine(newEngine);
         setIsSupported(true);
 
         // Notify parent component
         if (onEngineReady) {
-          onEngineReady(engineInstance);
+          onEngineReady(newEngine);
         }
 
         toast.success('Engine initialized successfully');
       } catch (err) {
+        if (!isMounted) return;
+        
         const error = err instanceof Error ? err : new Error('Failed to initialize engine');
         console.error('Engine initialization error:', error);
         setError(error);
@@ -123,23 +135,40 @@ export function EngineProvider({
           description: error.message,
         });
       } finally {
-        setIsInitializing(false);
+        if (isMounted) {
+          setIsInitializing(false);
+        }
       }
     };
 
     initializeEngine();
 
-    // Cleanup on unmount
+    // Cleanup on unmount - only destroy if the component is truly unmounting
+    // (not just a Strict Mode double-mount)
     return () => {
-      if (engineInstance) {
+      isMounted = false;
+      // We don't destroy the engine here because in Strict Mode,
+      // the cleanup runs and then the effect re-runs.
+      // The engine will be destroyed when the provider is truly unmounted
+      // (handled by the window beforeunload or when projectId changes)
+    };
+  }, [projectId]); // Only re-run when projectId changes
+
+  // Cleanup engine when projectId changes or component truly unmounts
+  useEffect(() => {
+    return () => {
+      // This cleanup runs when the component truly unmounts
+      // or when projectId changes
+      if (engineRef.current) {
         try {
-          engineInstance.destroy();
+          engineRef.current.destroy();
+          engineRef.current = null;
         } catch (err) {
           console.error('Error destroying engine:', err);
         }
       }
     };
-  }, [projectId, projectName, settings, canvas, onEngineReady, onEngineError]);
+  }, [projectId]);
 
   // Show loading state
   if (isInitializing) {

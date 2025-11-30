@@ -63,10 +63,11 @@ export type StateSubscriber = (state: State) => void;
 
 /**
  * Engine actions interface - combines historical and non-historical actions
+ * These are the actualized (callable) actions, not the blueprints
  */
 export interface EngineActions {
-  historical: typeof historical;
-  non_historical: typeof non_historical;
+  historical: ReturnType<typeof ZipAction.actualize<HistoricalState, typeof historical>>;
+  non_historical: ReturnType<typeof ZipAction.actualize<NonHistoricalState, typeof non_historical>>;
 }
 
 /**
@@ -214,6 +215,11 @@ export function createEngine(config: EngineConfig): EngineAPI {
   const videoExport = new VideoExport(actionsBundle, compositor, media);
   const project = new Project();
 
+  // Mark compositor as ready for rendering
+  // In omniclip, this is done via recreate() after loading from localStorage
+  // Since we start fresh, we mark it ready immediately
+  compositor.markReady();
+
   // Configure compositor canvas if specified
   if (config.canvas) {
     if (config.canvas.width && config.canvas.height) {
@@ -227,8 +233,24 @@ export function createEngine(config: EngineConfig): EngineAPI {
   // State subscribers
   const subscribers = new Set<StateSubscriber>();
 
+  // Register engine internals BEFORE setting up watch.track subscriptions
+  // This prevents "getState called but engine is not initialized" warnings
+  // because watch.track callbacks execute immediately when set up
+  registerEngineInternals({
+    getState,
+    getActions: () => actionsBundle,
+    controllers: {
+      media,
+      timeline,
+      compositor,
+      videoExport,
+      project,
+    },
+  });
+
   // Watch for state changes and notify subscribers
-  watch.track(() => coreInstance!.state, (historicalState) => {
+  const unwatchHistorical = watch.track(() => coreInstance?.state, (historicalState) => {
+    if (!coreInstance) return;
     const fullState = getState();
     subscribers.forEach((callback) => {
       try {
@@ -239,7 +261,8 @@ export function createEngine(config: EngineConfig): EngineAPI {
     });
   });
 
-  watch.track(() => nonHistoricalState!.state, (nonHistState) => {
+  const unwatchNonHistorical = watch.track(() => nonHistoricalState?.state, (nonHistState) => {
+    if (!nonHistoricalState) return;
     const fullState = getState();
     subscribers.forEach((callback) => {
       try {
@@ -260,9 +283,11 @@ export function createEngine(config: EngineConfig): EngineAPI {
       project,
     },
 
+    // Expose the actualized actions bundle (callable functions)
+    // The actionsBundle contains both historical (from coreInstance.actions) and non-historical actions
     actions: {
-      historical,
-      non_historical,
+      historical: coreInstance.actions,
+      non_historical: nonHistoricalActions,
     },
 
     getState,
@@ -279,25 +304,29 @@ export function createEngine(config: EngineConfig): EngineAPI {
     getEffects: () => getState().effects,
     getSelectedEffect: () => getState().selected_effect,
     setSelectedEffect: (effect: AnyEffect | null) => {
-      actionsBundle.set_selected_effect(effect, { omit: true });
+      if (actionsBundle) {
+        actionsBundle.set_selected_effect(effect, { omit: true });
+      }
     },
 
-    // Playback control
+    // Playback control - use compositor's methods to properly sync internal state
     play: () => {
-      actionsBundle.set_is_playing(true, { omit: true });
+      compositor.set_video_playing(true);
     },
 
     pause: () => {
-      actionsBundle.set_is_playing(false, { omit: true });
+      compositor.set_video_playing(false);
     },
 
     togglePlayback: () => {
-      actionsBundle.toggle_is_playing({ omit: true });
+      compositor.toggle_video_playing();
     },
 
     seek: (timecode: number) => {
-      actionsBundle.set_timecode(timecode, { omit: true });
-      compositor.seek(timecode);
+      if (actionsBundle) {
+        actionsBundle.set_timecode(timecode, { omit: true });
+        compositor.seek(timecode);
+      }
     },
 
     getCurrentTime: () => compositor.timecode,
@@ -319,10 +348,12 @@ export function createEngine(config: EngineConfig): EngineAPI {
 
     setZoom: (zoom: number) => {
       const clampedZoom = Math.max(-5, Math.min(5, zoom));
-      if (clampedZoom > getState().zoom) {
-        actionsBundle.zoom_in({ omit: true });
-      } else {
-        actionsBundle.zoom_out({ omit: true });
+      if (actionsBundle) {
+        if (clampedZoom > getState().zoom) {
+          actionsBundle.zoom_in({ omit: true });
+        } else {
+          actionsBundle.zoom_out({ omit: true });
+        }
       }
     },
 
@@ -347,37 +378,54 @@ export function createEngine(config: EngineConfig): EngineAPI {
 
     // Lifecycle
     destroy: () => {
+      // Destroy compositor first to stop the animation frame loop
+      // This prevents accessing destroyed state
+      try {
+        compositor.destroy();
+      } catch (e) {
+        console.warn("Error calling compositor.destroy()", e);
+      }
+
       // Pause playback
-      actionsBundle.set_is_playing(false, { omit: true });
+      if (actionsBundle) {
+        try {
+          actionsBundle.set_is_playing(false, { omit: true });
+        } catch (e) {
+          console.warn("Failed to pause on destroy", e);
+        }
+      }
+
+      // Unsubscribe from state watchers
+      unwatchHistorical();
+      unwatchNonHistorical();
 
       // Clear subscribers
       subscribers.clear();
 
-      // Cleanup compositor
-      compositor.clear();
-      compositor.app.destroy(true, {
-        children: true,
-        texture: true,
-        baseTexture: true,
-      });
+      // Cleanup compositor PIXI app
+      // Note: compositor.destroy() now handles app destruction internally
+      try {
+        if (!compositor.isDestroyed) {
+           compositor.destroy();
+        }
+      } catch (e) {
+        console.warn("Error destroying compositor", e);
+      }
 
       // Cleanup media
       // Media controller uses IndexedDB, which persists
       // No explicit cleanup needed
 
-      // Clear instances
+      // Clear instances - must be done after compositor.destroy() to prevent
+      // the animation frame loop from accessing null state
       coreInstance = null;
       nonHistoricalState = null;
       actionsBundle = null;
     },
   };
 
-  // Register internals for global access via omnislate proxy
-  registerEngineInternals({
-    getState,
-    getActions: () => actionsBundle,
-    controllers: engine.controllers,
-  });
+  // Note: registerEngineInternals was called earlier, before watch.track subscriptions
+  // to prevent "getState called but engine is not initialized" warnings
 
   return engine;
 }

@@ -25,6 +25,22 @@ import type { TextStyleAlign } from '../state/pixi.mjs';
 import { generate_id } from '@benev/slate/x/tools/generate_id';
 
 /**
+ * Error thrown when media is not yet synced to the engine
+ * This is expected during initial load - media will be synced shortly
+ */
+export class MediaNotSyncedError extends Error {
+  public readonly mediaId: string;
+  public readonly elementName: string;
+  
+  constructor(mediaId: string, elementName: string) {
+    super(`Media not yet synced: ${mediaId} (${elementName})`);
+    this.name = 'MediaNotSyncedError';
+    this.mediaId = mediaId;
+    this.elementName = elementName;
+  }
+}
+
+/**
  * Map TextStyleAlign (which includes "justify") to the limited set supported by TextElement
  */
 function mapTextAlign(align: TextStyleAlign | undefined): "left" | "center" | "right" {
@@ -200,8 +216,10 @@ export function alphaxToOmniclip(
   const mediaElement = element as MediaElement;
   const fileHash = getFileHash(mediaElement.mediaId);
   
+  // If media not yet synced to engine, skip this element
+  // It will be added once syncMediaToEngine completes
   if (!fileHash) {
-    throw new Error(`No file hash found for media ID: ${mediaElement.mediaId}`);
+    throw new MediaNotSyncedError(mediaElement.mediaId, element.name);
   }
 
   // Determine media type from MediaFile
@@ -325,13 +343,25 @@ export function omniclipToAlphax(
 }
 
 /**
+ * Result of converting tracks to effects
+ */
+export interface TracksToEffectsResult {
+  effects: AnyEffect[];
+  pendingMediaIds: string[];
+}
+
+/**
  * Convert array of Alphax timeline tracks to Omniclip effects
+ * 
+ * Returns both the converted effects and a list of media IDs that are pending sync.
+ * This allows the caller to retry once media is synced.
  */
 export function tracksToEffects(
   tracks: TimelineTrack[],
   mediaFiles: Map<string, MediaFile>
-): AnyEffect[] {
+): TracksToEffectsResult {
   const effects: AnyEffect[] = [];
+  const pendingMediaIds: string[] = [];
 
   for (const track of tracks) {
     for (const element of track.elements) {
@@ -343,12 +373,18 @@ export function tracksToEffects(
         const effect = alphaxToOmniclip(element, track, tracks, mediaFile);
         effects.push(effect);
       } catch (error) {
-        console.error('Error converting element to effect:', error, element);
+        // Handle media not yet synced - track it for retry
+        if (error instanceof MediaNotSyncedError) {
+          pendingMediaIds.push(error.mediaId);
+          // Don't log - this is expected during initial sync
+        } else {
+          console.error('Error converting element to effect:', error, element);
+        }
       }
     }
   }
 
-  return effects;
+  return { effects, pendingMediaIds };
 }
 
 /**

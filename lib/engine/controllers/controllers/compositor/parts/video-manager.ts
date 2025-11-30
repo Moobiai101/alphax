@@ -14,7 +14,7 @@ import * as PIXI from "pixi.js"
 
 export class VideoManager extends Map<string, {sprite: PIXISprite, transformer: PIXIContainer}> {
 	#effect_canvas = new Map<string, HTMLCanvasElement>()
-	#videoElements = new Map<string, Texture<TextureSource<HTMLVideoElement>>>()
+	#videoElements = new Map<string, Texture>()
 
 	constructor(private compositor: Compositor, private actions: Actions) {
 		super()

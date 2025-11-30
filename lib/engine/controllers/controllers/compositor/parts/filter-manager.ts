@@ -6,7 +6,7 @@ import {Actions} from "../../../../state/actions"
 import {ImageEffect, VideoEffect} from "../../../../state/types"
 
 //@ts-ignore
-const filters = {...PIXI, ...(PIXI.filters || {})}
+const filters = {...(PIXI.filters || {}), ...PIXI}
 export interface Filter {
 	targetEffectId: string
 	type: FilterType

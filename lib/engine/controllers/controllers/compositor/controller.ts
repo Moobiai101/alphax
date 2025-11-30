@@ -62,6 +62,8 @@ export class Compositor {
 	#app: PIXIApplication | null = null
 	#seekedResolve: ((value: unknown) => void) | null = null
 	#recreated = false
+	#destroyed = false
+	#animationFrameId: number | null = null
 	
 	managers!: Managers
 	guidelines!: AlignGuidelines
@@ -71,6 +73,14 @@ export class Compositor {
 
 	// Lazy PIXI.Application initialization for Turbopack compatibility
 	get app(): PIXIApplication {
+		if (this.#destroyed) {
+			console.warn("Accessing destroyed Compositor app");
+			// Return a dummy or throw error? Returning null might break types.
+			// We'll return the existing (destroyed) app if available, or throw.
+			if (this.#app) return this.#app;
+			throw new Error('Compositor is destroyed');
+		}
+
 		if (!this.#app) {
 			if (typeof window === 'undefined') {
 				throw new Error('PIXI.Application can only be created in browser environment')
@@ -84,7 +94,7 @@ export class Compositor {
 	constructor(private actions: Actions) {
 		this.#on_selected_canvas_object()
 		this.app.stage.sortableChildren = true
-		this.app.stage.interactive = true
+		this.app.stage.eventMode = 'static'
 		const {guidelines, guidelintRect} = this.init_guidelines()
 		this.guidelines = guidelines
 		this.#guidelineRect = guidelintRect
@@ -102,7 +112,9 @@ export class Compositor {
 			transitionManager: new TransitionManager(this, actions)
 		}
 
-		this.#on_playing()
+		// Don't start the animation frame loop here - wait for markReady() to be called
+		// This prevents accessing omnislate.context.state before engine internals are registered
+		
 		reactor.reaction(
 			() => this.#is_playing.value,
 			(is_playing) => {
@@ -122,6 +134,11 @@ export class Compositor {
 	}
 
 	#on_playing = () => {
+		// Stop the loop if compositor is destroyed
+		if (this.#destroyed) {
+			return;
+		}
+		
 		if(!this.#is_playing.value) {
 			this.#pause_time = performance.now() - this.#last_time
 		}
@@ -131,7 +148,7 @@ export class Compositor {
 			this.on_playing.publish(0)
 			this.compose_effects([...this.currently_played_effects.values()], this.timecode)
 		}
-		requestAnimationFrame(this.#on_playing)
+		this.#animationFrameId = requestAnimationFrame(this.#on_playing)
 	}
 
 	canvasElementDrag = {
@@ -174,6 +191,9 @@ export class Compositor {
 	}
 
 	clear(omit?: boolean) {
+		if (this.#destroyed || !this.#app || !this.#app.renderer) {
+			return;
+		}
 		this.app.renderer.clear()
 		this.app.stage.removeChildren()
 		const {guidelines, guidelintRect} = this.init_guidelines()
@@ -494,6 +514,59 @@ export class Compositor {
 	toggle_video_playing = () => {
 		this.#is_playing.value = !this.#is_playing.value
 		this.actions.toggle_is_playing({omit: true})
+	}
+
+	/**
+	 * Mark compositor as ready for rendering
+	 * Called after engine initialization to enable compose_effects
+	 * This also starts the animation frame loop for playback
+	 */
+	markReady() {
+		this.#recreated = true
+		// Start the animation frame loop now that engine internals are registered
+		this.#on_playing()
+	}
+
+	/**
+	 * Check if compositor is ready for rendering
+	 */
+	get isReady() {
+		return this.#recreated
+	}
+
+	get isDestroyed() {
+		return this.#destroyed
+	}
+
+	/**
+	 * Destroy the compositor and clean up resources
+	 * Stops the animation frame loop to prevent accessing destroyed state
+	 */
+	destroy() {
+		this.#destroyed = true
+		this.#is_playing.value = false
+		
+		// Cancel the animation frame loop
+		if (this.#animationFrameId !== null) {
+			cancelAnimationFrame(this.#animationFrameId)
+			this.#animationFrameId = null
+		}
+		
+		// Clear currently played effects
+		this.currently_played_effects.clear()
+		
+		// Clear on_playing subscribers by replacing the publisher
+		this.on_playing = pub()
+		
+		// Destroy PIXI app instance
+		if (this.#app) {
+			try {
+				this.#app.destroy(true, {children: true, texture: true, baseTexture: true})
+			} catch (e) {
+				console.warn("Error destroying PIXI app inside Compositor", e)
+			}
+			this.#app = null
+		}
 	}
 
 }

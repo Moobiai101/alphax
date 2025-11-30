@@ -52,6 +52,16 @@ export function isDOMElement(el: any): el is HTMLElement {
   return !!el && (el instanceof Element || el instanceof HTMLElement);
 }
 
+/**
+ * Validates if a string is a valid UUID v4 format
+ * Matches the format: xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx
+ * where x is any hexadecimal digit and y is one of 8, 9, A, or B
+ */
+export function isValidUUID(id: string): boolean {
+  const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
+  return uuidRegex.test(id);
+}
+
 export function isTypableElement(el: HTMLElement): boolean {
   // If content editable, then it is editable
   if (el.isContentEditable) return true;

@@ -5,6 +5,7 @@ import { useParams, useRouter } from "next/navigation";
 import { useProjectStore } from "@/lib/stores/project-store";
 import { EditorProvider } from "@/components/providers/editor-provider";
 import { usePlaybackControls } from "@/lib/hooks/use-playback-controls";
+import { isValidUUID } from "@/lib/utils";
 import dynamic from "next/dynamic";
 
 // Dynamic import with SSR disabled to prevent HTMLElement errors
@@ -38,6 +39,22 @@ export default function Editor() {
 
     const initProject = async () => {
       if (!projectId) {
+        return;
+      }
+
+      // Validate project ID format (must be valid UUID v4)
+      if (!isValidUUID(projectId)) {
+        console.warn(`Invalid project ID format: ${projectId}. Creating new project.`);
+        markProjectIdAsInvalid(projectId);
+        
+        try {
+          const newProjectId = await createNewProject("Untitled Project");
+          if (!isCancelled) {
+            router.replace(`/editor/${newProjectId}`);
+          }
+        } catch (createError) {
+          console.error("Failed to create new project:", createError);
+        }
         return;
       }
 

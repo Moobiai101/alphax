@@ -25,7 +25,7 @@ import { Checkbox } from "@/components/ui/checkbox";
 import { Label } from "../ui/label";
 import { SocialsIcon } from "../icons";
 import { PLATFORM_LAYOUTS, type PlatformLayout } from "@/lib/stores/editor-store";
-import { tracksToEffects } from "@/lib/engine/adapters";
+import { tracksToEffects, syncMediaToEngine } from "@/lib/engine/adapters";
 import { TextElement, TimelineElement, TimelineTrack } from "@/types/timeline";
 
 export function PreviewPanel() {
@@ -46,74 +46,197 @@ export function PreviewPanel() {
   const isMounted = useRef(false);
   const syncLock = useRef(false);
 
+  // Sync media to engine
+  useEffect(() => {
+    const sync = async () => {
+      if (engine && mediaFiles.length > 0) {
+        try {
+          await syncMediaToEngine(mediaFiles, engine.controllers.media);
+        } catch (error) {
+          console.error("Failed to sync media to engine:", error);
+        }
+      }
+    };
+    sync();
+  }, [engine, mediaFiles]);
+
   // Sync Zustand state to engine (one-way: Zustand -> Engine)
   useEffect(() => {
     if (syncLock.current) return;
     
-    // Sync playback state
-    if (zustandIsPlaying !== engine.isPlaying()) {
-      syncLock.current = true;
-      if (zustandIsPlaying) {
-        engine.play();
-      } else {
-        engine.pause();
+    // Guard: check if engine is ready
+    try {
+      const compositor = engine.controllers.compositor;
+      if (compositor.isDestroyed) return;
+      
+      // Sync playback state
+      if (zustandIsPlaying !== engine.isPlaying()) {
+        syncLock.current = true;
+        if (zustandIsPlaying) {
+          engine.play();
+        } else {
+          engine.pause();
+        }
+        syncLock.current = false;
       }
-      syncLock.current = false;
+    } catch (e) {
+      // Engine not ready or destroyed
     }
   }, [zustandIsPlaying, engine]);
 
   useEffect(() => {
     if (syncLock.current) return;
     
-    // Sync current time
-    const engineTime = engine.getCurrentTime();
-    if (Math.abs(zustandCurrentTime - engineTime) > 16) { // > 16ms difference
-      syncLock.current = true;
-      engine.seek(zustandCurrentTime);
-      syncLock.current = false;
+    // Guard: check if engine is ready
+    try {
+      const compositor = engine.controllers.compositor;
+      if (compositor.isDestroyed) return;
+      
+      // Sync current time and compose effects when seeking
+      const engineTime = engine.getCurrentTime();
+      if (Math.abs(zustandCurrentTime - engineTime) > 16) { // > 16ms difference
+        syncLock.current = true;
+        engine.seek(zustandCurrentTime);
+        
+        // Compose effects at the new timecode (critical for showing video frames when paused)
+        const state = engine.getState();
+        compositor.compose_effects(state.effects, zustandCurrentTime);
+        compositor.seek(zustandCurrentTime, true).then(() => {
+          if (!compositor.isDestroyed) {
+            compositor.compose_effects(state.effects, zustandCurrentTime);
+          }
+        });
+        
+        syncLock.current = false;
+      }
+    } catch (e) {
+      // Engine not ready or destroyed
     }
   }, [zustandCurrentTime, engine]);
 
+  // Track pending media for retry
+  const pendingMediaRef = useRef<Set<string>>(new Set());
+  const retryTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
   // Sync timeline effects to engine
   useEffect(() => {
-    try {
-      const mediaFilesMap = new Map(mediaFiles.map(m => [m.id, m]));
-      const effects = tracksToEffects(tracks, mediaFilesMap);
-      
-      // Update engine state with new effects
-      const currentEffects = engine.getEffects();
-      
-      // Only update if effects have changed
-      const effectsChanged = JSON.stringify(effects) !== JSON.stringify(currentEffects);
-      
-      if (effectsChanged) {
-        // Clear and re-add effects
-        engine.actions.historical.remove_all_effects({ omit: true });
+    let isMounted = true;
+
+    const syncEffects = async () => {
+      try {
+        const mediaFilesMap = new Map(mediaFiles.map(m => [m.id, m]));
+        const { effects, pendingMediaIds } = tracksToEffects(tracks, mediaFilesMap);
         
-        for (const effect of effects) {
-          if (effect.kind === 'video') {
-            engine.actions.historical.add_video_effect(effect, { omit: true });
-          } else if (effect.kind === 'audio') {
-            engine.actions.historical.add_audio_effect(effect, { omit: true });
-          } else if (effect.kind === 'image') {
-            engine.actions.historical.add_image_effect(effect, { omit: true });
-          } else if (effect.kind === 'text') {
-            engine.actions.historical.add_text_effect(effect, { omit: true });
+        if (!isMounted) return;
+
+        // Track pending media for retry
+        if (pendingMediaIds.length > 0) {
+          pendingMediaIds.forEach(id => pendingMediaRef.current.add(id));
+          
+          // Schedule retry if there are pending media
+          if (retryTimeoutRef.current) {
+            clearTimeout(retryTimeoutRef.current);
+          }
+          retryTimeoutRef.current = setTimeout(() => {
+            if (isMounted) syncEffects();
+          }, 500); // Retry after 500ms
+        } else {
+          // All media synced, clear pending
+          pendingMediaRef.current.clear();
+        }
+        
+        if (!isMounted) return;
+
+        // Update engine state with new effects
+        const currentEffects = engine.getEffects();
+        
+        // Only update if effects have changed
+        const effectsChanged = JSON.stringify(effects) !== JSON.stringify(currentEffects);
+        
+        if (effectsChanged && effects.length > 0) {
+          const compositor = engine.controllers.compositor;
+          const media = engine.controllers.media;
+          
+          // Wait for media files to be ready before recreating
+          await media.are_files_ready();
+          
+          if (!isMounted) return;
+
+          // Check if engine/compositor is destroyed
+          if (compositor.isDestroyed || (compositor.app && compositor.app.renderer === null)) {
+             return;
+          }
+
+          // Clear compositor and reset state
+          try {
+             compositor.clear();
+          } catch (e) {
+             console.warn("Failed to clear compositor:", e);
+             return; // Stop if compositor is broken
+          }
+
+          engine.actions.historical.remove_all_effects();
+          
+          // Add effects to state
+          for (const effect of effects) {
+            if (effect.kind === 'video') {
+              engine.actions.historical.add_video_effect(effect);
+            } else if (effect.kind === 'audio') {
+              engine.actions.historical.add_audio_effect(effect);
+            } else if (effect.kind === 'image') {
+              engine.actions.historical.add_image_effect(effect);
+            } else if (effect.kind === 'text') {
+              engine.actions.historical.add_text_effect(effect);
+            }
+          }
+          
+          // Recreate compositor objects from state (critical for video playback)
+          // This mirrors omniclip's #recreate_project_from_localstorage_state
+          const state = engine.getState();
+          await compositor.recreate(state, media);
+          
+          if (!isMounted) return;
+
+          // Compose effects at current timecode to show initial frame
+          compositor.compose_effects(state.effects, state.timecode);
+        } else if (effects.length === 0 && currentEffects.length > 0) {
+          // Clear all effects
+          engine.actions.historical.remove_all_effects();
+          try {
+            engine.controllers.compositor.clear();
+          } catch (e) {
+            console.warn("Failed to clear compositor:", e);
           }
         }
+      } catch (error) {
+        console.error('Error syncing effects to engine:', error);
       }
-    } catch (error) {
-      console.error('Error syncing effects to engine:', error);
-    }
+    };
+    
+    syncEffects();
+    
+    return () => {
+      isMounted = false;
+      if (retryTimeoutRef.current) {
+        clearTimeout(retryTimeoutRef.current);
+      }
+    };
   }, [tracks, mediaFiles, engine]);
 
-  // Mount PIXI canvas
+  // Mount PIXI canvas and set up playback loop
   useEffect(() => {
     const container = pixiContainerRef.current;
     if (!container || isMounted.current) return;
 
     try {
       const compositor = engine.controllers.compositor;
+      
+      // Guard: don't mount if compositor is destroyed
+      if (compositor.isDestroyed) {
+        console.warn('Cannot mount PIXI canvas: compositor is destroyed');
+        return;
+      }
+      
       const pixiCanvas = compositor.app.view as HTMLCanvasElement;
       
       // Set canvas styles for proper display
@@ -129,7 +252,25 @@ export function PreviewPanel() {
 
       console.log('✅ PIXI canvas mounted successfully');
 
+      // Subscribe to compositor's on_playing event to compose effects on each frame
+      // This is critical for video playback - mirrors omniclip's MediaPlayer behavior
+      // pub() returns a function that takes a listener and returns an unsubscribe function
+      const unsubOnPlaying = compositor.on_playing(() => {
+        // Guard against destroyed compositor
+        if (compositor.isDestroyed) return;
+        
+        try {
+          const state = engine.getState();
+          if (!state.is_exporting) {
+            compositor.compose_effects(state.effects, state.timecode);
+          }
+        } catch (e) {
+          // Engine destroyed during callback
+        }
+      });
+
       return () => {
+        unsubOnPlaying();
         if (container.contains(pixiCanvas)) {
           container.removeChild(pixiCanvas);
         }
@@ -186,12 +327,14 @@ export function PreviewPanel() {
 
       setPreviewDimensions({ width, height });
 
-      // Update compositor canvas size
+      // Update compositor canvas size - with proper guards
       try {
-        const compositor = engine.controllers.compositor;
-        compositor.app.renderer.resize(canvasSize.width, canvasSize.height);
+        const compositor = engine?.controllers?.compositor;
+        if (compositor && !compositor.isDestroyed && compositor.app?.renderer) {
+          compositor.set_canvas_resolution(canvasSize.width, canvasSize.height);
+        }
       } catch (error) {
-        console.error('Error resizing compositor:', error);
+        // Compositor not ready or destroyed - ignore silently
       }
     };
 
