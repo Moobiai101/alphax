@@ -212,9 +212,19 @@ export class Compositor {
 	}
 
 	compose_effects(effects: AnyEffect[], timecode: number, exporting?: boolean) {
-		if(!this.#recreated) {return}
+		if(!this.#recreated) {
+			console.log('[Compositor.compose_effects] Skipping - not recreated yet')
+			return
+		}
 		this.timecode = timecode
 		this.#update_currently_played_effects(effects, timecode, exporting)
+		
+		// Update video textures to show current frame
+		// This is critical for video playback - PIXI video textures need manual updates
+		// when autoPlay is disabled
+		this.managers.videoManager.update_video_textures()
+		
+		console.log('[Compositor.compose_effects] Rendering at timecode:', timecode, 'currently_played_effects:', this.currently_played_effects.size, 'stage children:', this.app.stage.children.length)
 		this.app.render()
 	}
 
@@ -271,8 +281,9 @@ export class Compositor {
 				}
 			}
 			if(effect.kind === "video") {
-				const video = this.managers.videoManager.get(effect.id)?.sprite
-				const element = (video?.texture?.baseTexture as any)?.resource?.source as HTMLVideoElement | null
+				// Use the element directly from VideoEntry
+				const videoEntry = this.managers.videoManager.get(effect.id)
+				const element = videoEntry?.element
 				if(!redraw && element?.paused && this.#is_playing.value) {await element.play()}
 				if(redraw && timecode && element) {
 					const current_time = this.get_effect_current_time_relative_to_timecode(effect, timecode)
@@ -307,8 +318,11 @@ export class Compositor {
 			else if(effect.kind === "video") {
 				this.currently_played_effects.set(effect.id, effect)
 				this.managers.videoManager.add_video_to_canvas(effect)
-				const element = (this.managers.videoManager.get(effect.id)?.sprite?.texture?.baseTexture as any)?.resource?.source as HTMLVideoElement
-				if(element) {element.currentTime = effect.start / 1000}
+				// Use the element directly from VideoEntry
+				const videoEntry = this.managers.videoManager.get(effect.id)
+				if(videoEntry?.element) {
+					videoEntry.element.currentTime = effect.start / 1000
+				}
 			}
 			else if(effect.kind === "text") {
 				this.currently_played_effects.set(effect.id, effect)
@@ -410,17 +424,26 @@ export class Compositor {
 
 	async recreate(state: State, media: Media) {
 		await media.are_files_ready()
+		console.log('[Compositor.recreate] Starting recreate with', state.effects.length, 'effects')
+		console.log('[Compositor.recreate] Media controller has', media.size, 'files')
+		
 		for(const effect of state.effects) {
 			if(effect.kind === "image") {
-				const file = media.get(effect.file_hash)?.file
+				const mediaEntry = media.get(effect.file_hash)
+				console.log('[Compositor.recreate] Image effect', effect.id, 'file_hash:', effect.file_hash, 'found:', !!mediaEntry)
+				const file = mediaEntry?.file
 				if(file) {
 					await this.managers.imageManager.add_image_effect(effect , file, true)
 				}
 			}
 			else if(effect.kind === "video") {
-				const file = media.get(effect.file_hash)?.file
-				if(file)
+				const mediaEntry = media.get(effect.file_hash)
+				console.log('[Compositor.recreate] Video effect', effect.id, 'file_hash:', effect.file_hash, 'found:', !!mediaEntry)
+				const file = mediaEntry?.file
+				if(file) {
 					this.managers.videoManager.add_video_effect(effect, file, true)
+					console.log('[Compositor.recreate] Video effect added, VideoManager size:', this.managers.videoManager.size)
+				}
 			}
 			else if(effect.kind === "audio") {
 				const file = media.get(effect.file_hash)?.file
@@ -442,6 +465,7 @@ export class Compositor {
 		}
 		this.managers.animationManager.refresh(state)
 		this.#recreated = true
+		console.log('[Compositor.recreate] Recreate complete, calling compose_effects at timecode:', this.timecode)
 		this.compose_effects(state.effects, this.timecode)
 	}
 

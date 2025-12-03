@@ -124,16 +124,18 @@ export function getTrackId(trackIndex: number, tracks: TimelineTrack[]): string 
 
 /**
  * Create default effect rect for visual elements
+ * Centers the element on a 1920x1080 canvas
  */
-function createDefaultRect(width: number = 1920, height: number = 1080): EffectRect {
+function createDefaultRect(width: number = 1920, height: number = 1080, canvasWidth: number = 1920, canvasHeight: number = 1080): EffectRect {
   return {
     width,
     height,
     scaleX: 1,
     scaleY: 1,
     position_on_canvas: {
-      x: 0,
-      y: 0,
+      // Center the element on the canvas
+      x: canvasWidth / 2,
+      y: canvasHeight / 2,
     },
     rotation: 0,
     pivot: {

@@ -69,15 +69,15 @@ export function PreviewPanel() {
       const compositor = engine.controllers.compositor;
       if (compositor.isDestroyed) return;
       
-      // Sync playback state
-      if (zustandIsPlaying !== engine.isPlaying()) {
-        syncLock.current = true;
-        if (zustandIsPlaying) {
-          engine.play();
-        } else {
-          engine.pause();
-        }
-        syncLock.current = false;
+    // Sync playback state
+    if (zustandIsPlaying !== engine.isPlaying()) {
+      syncLock.current = true;
+      if (zustandIsPlaying) {
+        engine.play();
+      } else {
+        engine.pause();
+      }
+      syncLock.current = false;
       }
     } catch (e) {
       // Engine not ready or destroyed
@@ -92,7 +92,14 @@ export function PreviewPanel() {
       const compositor = engine.controllers.compositor;
       if (compositor.isDestroyed) return;
       
-      // Sync current time and compose effects when seeking
+      // Only sync time when NOT playing - during playback, engine controls time
+      // This prevents sync loops that cause timecode jumps
+      if (zustandIsPlaying) {
+        console.log('[PreviewPanel] Skipping time sync during playback - engine controls time');
+        return;
+      }
+      
+      // Sync current time and compose effects when seeking (paused only)
       const engineTime = engine.getCurrentTime();
       if (Math.abs(zustandCurrentTime - engineTime) > 16) { // > 16ms difference
         syncLock.current = true;
@@ -112,7 +119,7 @@ export function PreviewPanel() {
     } catch (e) {
       // Engine not ready or destroyed
     }
-  }, [zustandCurrentTime, engine]);
+  }, [zustandCurrentTime, engine, zustandIsPlaying]);
 
   // Track pending media for retry
   const pendingMediaRef = useRef<Set<string>>(new Set());
@@ -128,7 +135,7 @@ export function PreviewPanel() {
         const { effects, pendingMediaIds } = tracksToEffects(tracks, mediaFilesMap);
         
         if (!isMounted) return;
-
+        
         // Track pending media for retry
         if (pendingMediaIds.length > 0) {
           pendingMediaIds.forEach(id => pendingMediaRef.current.add(id));
@@ -146,7 +153,7 @@ export function PreviewPanel() {
         }
         
         if (!isMounted) return;
-
+        
         // Update engine state with new effects
         const currentEffects = engine.getEffects();
         
@@ -223,63 +230,90 @@ export function PreviewPanel() {
     };
   }, [tracks, mediaFiles, engine]);
 
-  // Mount PIXI canvas and set up playback loop
+  // Mount PIXI canvas and set up playback loop - ONCE only
+  // This effect should run only ONCE when the component mounts and engine is ready
   useEffect(() => {
-    const container = pixiContainerRef.current;
-    if (!container || isMounted.current) return;
-
-    try {
-      const compositor = engine.controllers.compositor;
-      
-      // Guard: don't mount if compositor is destroyed
-      if (compositor.isDestroyed) {
-        console.warn('Cannot mount PIXI canvas: compositor is destroyed');
+    console.log('[PreviewPanel] Canvas mount useEffect running, container:', !!pixiContainerRef.current, 'isMounted:', isMounted.current);
+    
+    // Don't run if already mounted
+    if (isMounted.current) {
+      console.log('[PreviewPanel] Already mounted, skipping');
+      return;
+    }
+    
+    // Use a timeout to ensure the container is rendered (React ref timing)
+    const timeoutId = setTimeout(() => {
+      const container = pixiContainerRef.current;
+      if (!container) {
+        console.log('[PreviewPanel] No container ref after timeout, skipping mount');
         return;
       }
-      
-      const pixiCanvas = compositor.app.view as HTMLCanvasElement;
-      
-      // Set canvas styles for proper display
-      pixiCanvas.style.position = 'absolute';
-      pixiCanvas.style.top = '0';
-      pixiCanvas.style.left = '0';
-      pixiCanvas.style.width = '100%';
-      pixiCanvas.style.height = '100%';
-      pixiCanvas.style.objectFit = 'contain';
-      
-      container.appendChild(pixiCanvas);
-      isMounted.current = true;
 
-      console.log('✅ PIXI canvas mounted successfully');
-
-      // Subscribe to compositor's on_playing event to compose effects on each frame
-      // This is critical for video playback - mirrors omniclip's MediaPlayer behavior
-      // pub() returns a function that takes a listener and returns an unsubscribe function
-      const unsubOnPlaying = compositor.on_playing(() => {
-        // Guard against destroyed compositor
-        if (compositor.isDestroyed) return;
+      try {
+        const compositor = engine.controllers.compositor;
+        console.log('[PreviewPanel] Compositor:', !!compositor, 'isDestroyed:', compositor?.isDestroyed);
         
-        try {
-          const state = engine.getState();
-          if (!state.is_exporting) {
-            compositor.compose_effects(state.effects, state.timecode);
-          }
-        } catch (e) {
-          // Engine destroyed during callback
+        // Guard: don't mount if compositor is destroyed
+        if (compositor.isDestroyed) {
+          console.warn('Cannot mount PIXI canvas: compositor is destroyed');
+          return;
         }
-      });
+        
+        const pixiCanvas = compositor.app.view as HTMLCanvasElement;
+        console.log('[PreviewPanel] Got PIXI canvas:', !!pixiCanvas, 'tagName:', pixiCanvas?.tagName);
+        
+        // Set canvas styles for proper display
+        pixiCanvas.style.position = 'absolute';
+        pixiCanvas.style.top = '0';
+        pixiCanvas.style.left = '0';
+        pixiCanvas.style.width = '100%';
+        pixiCanvas.style.height = '100%';
+        pixiCanvas.style.objectFit = 'contain';
+        
+        container.appendChild(pixiCanvas);
+        isMounted.current = true;
 
-      return () => {
-        unsubOnPlaying();
-        if (container.contains(pixiCanvas)) {
-          container.removeChild(pixiCanvas);
-        }
-        isMounted.current = false;
-      };
-    } catch (error) {
-      console.error('Failed to mount PIXI canvas:', error);
-    }
-  }, [engine]);
+        console.log('✅ PIXI canvas mounted successfully');
+
+        // Subscribe to compositor's on_playing event to compose effects on each frame
+        // This is critical for video playback - mirrors omniclip's MediaPlayer behavior
+        // pub() returns a function that takes a listener and returns an unsubscribe function
+        const unsubOnPlaying = compositor.on_playing(() => {
+          // Guard against destroyed compositor
+          if (compositor.isDestroyed) return;
+          
+          try {
+            const state = engine.getState();
+            if (!state.is_exporting) {
+              compositor.compose_effects(state.effects, state.timecode);
+            }
+          } catch (e) {
+            // Engine destroyed during callback
+          }
+        });
+
+        // Store cleanup function in a ref so we can call it on unmount
+        const cleanup = () => {
+          console.log('[PreviewPanel] Cleaning up PIXI canvas mount');
+          unsubOnPlaying();
+          if (container.contains(pixiCanvas)) {
+            container.removeChild(pixiCanvas);
+          }
+          isMounted.current = false;
+        };
+
+        // Return cleanup to be called on component unmount ONLY
+        return cleanup;
+      } catch (error) {
+        console.error('Failed to mount PIXI canvas:', error);
+      }
+    }, 100); // Small delay to ensure container is rendered
+
+    // Cleanup timeout on unmount
+    return () => {
+      clearTimeout(timeoutId);
+    };
+  }, [engine]); // Only depend on engine - mount once and keep mounted
 
   // Update preview dimensions
   useEffect(() => {

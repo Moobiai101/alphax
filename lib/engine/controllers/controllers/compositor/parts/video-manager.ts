@@ -8,11 +8,18 @@ import {VideoEffect, State} from "../../../../state/types"
 import {isEffectMuted} from "../utils/is_effect_muted"
 import {Video} from "../../../../types/media-types"
 import {find_place_for_new_effect} from "../../timeline/utils/find_place_for_new_effect"
-import {Sprite as PIXISprite, Container as PIXIContainer, Texture, TextureSource} from "pixi.js"
+import {Sprite as PIXISprite, Container as PIXIContainer, Texture, BaseTexture, VideoResource} from "pixi.js"
 import * as PIXI from "pixi.js"
 // import {Transformer} from "pixi-transformer"
 
-export class VideoManager extends Map<string, {sprite: PIXISprite, transformer: PIXIContainer}> {
+interface VideoEntry {
+	sprite: PIXISprite;
+	transformer: PIXIContainer;
+	element: HTMLVideoElement;
+	videoResource: VideoResource;
+}
+
+export class VideoManager extends Map<string, VideoEntry> {
 	#effect_canvas = new Map<string, HTMLCanvasElement>()
 	#videoElements = new Map<string, Texture>()
 
@@ -61,9 +68,26 @@ export class VideoManager extends Map<string, {sprite: PIXISprite, transformer: 
 		element.src = obj
 		element.width = effect.rect.width
 		element.height = effect.rect.height
-		const texture = PIXI.Texture.from(element)
-		this.#videoElements.set(effect.id, texture as any)
-		;(texture.baseTexture.resource as any).autoPlay = false
+		element.crossOrigin = 'anonymous'
+		element.preload = 'auto'
+		element.muted = true // Muted initially to allow autoplay
+		element.playsInline = true
+		
+		// Create VideoResource with proper settings for PIXI.js v7
+		const videoResource = new VideoResource(element, {
+			autoPlay: false,
+			autoLoad: true,
+			updateFPS: 0, // Update at every render for smooth playback
+			crossorigin: true,
+			muted: true,
+			playsinline: true,
+		})
+		
+		// Create base texture and texture from video resource
+		const baseTexture = new BaseTexture(videoResource)
+		const texture = new Texture(baseTexture)
+		this.#videoElements.set(effect.id, texture)
+		
 		const sprite = new PIXI.Sprite(texture)
 		sprite.pivot.set(effect.rect.pivot.x, effect.rect.pivot.y)
 		sprite.x = effect.rect.position_on_canvas.x
@@ -75,20 +99,9 @@ export class VideoManager extends Map<string, {sprite: PIXISprite, transformer: 
 		sprite.eventMode = "static"
 		sprite.cursor = "pointer"
 		sprite.filters = []
-		//@ts-ignore
-		// const transformer = new Transformer({
-		// 	boxRotationEnabled: true,
-		// 	translateEnabled: false, // implemented my own translate which work with align guidelines
-		// 	group: [sprite],
-		// 	stage: this.compositor.app.stage,
-		// 	wireframeStyle: {
-		// 		thickness: 2,
-		// 		color: 0xff0000
-		// 	}
-		// })
-		// transformer.name = generate_id()
-		// transformer.ignoreAlign = true
-        const transformer = new PIXI.Container() as any;
+		
+		// Dummy transformer for now (transformer functionality is commented out)
+		const transformer = new PIXI.Container() as any;
 
 		sprite.on('pointerdown', (e) => {
 			// this.compositor.canvasElementDrag.onDragStart(e, sprite, transformer)
@@ -97,20 +110,33 @@ export class VideoManager extends Map<string, {sprite: PIXISprite, transformer: 
 		;(sprite as any).effect = { ...effect }
 		//@ts-ignore
 		sprite.ignoreAlign = false
-		this.set(effect.id, {sprite, transformer})
+		
+		// Store video entry with element and resource reference
+		this.set(effect.id, { sprite, transformer, element, videoResource })
+		
 		const canvas = document.createElement("canvas")
 		canvas.getContext("2d")!.imageSmoothingEnabled = false
 		this.#effect_canvas.set(effect.id, canvas)
+		
+		// Load the video resource and update texture when ready
+		videoResource.load().then(() => {
+			baseTexture.update()
+		}).catch((err: Error) => {
+			console.error('[VideoManager] Failed to load video:', err)
+		})
+		
 		if(recreate) {return}
 		this.actions.add_video_effect(effect)
 	}
 
 	add_video_to_canvas(effect: VideoEffect) {
 		const video = this.get(effect.id)
+		console.log('[VideoManager.add_video_to_canvas] Effect:', effect.id, 'Found:', !!video, 'Sprite:', !!video?.sprite)
 		if(video) {
 			this.compositor.app.stage.addChild(video.sprite)
 			video.sprite.zIndex = omnislate.context.state.tracks.length - effect.track
 			video.transformer.zIndex = omnislate.context.state.tracks.length - effect.track
+			console.log('[VideoManager.add_video_to_canvas] Added sprite to stage, stage children:', this.compositor.app.stage.children.length)
 		}
 	}
 
@@ -124,34 +150,33 @@ export class VideoManager extends Map<string, {sprite: PIXISprite, transformer: 
 
 	//reset element to state before export started
 	reset(effect: VideoEffect) {
-		const video = this.get(effect.id)?.sprite
-		if(video) {
+		const videoEntry = this.get(effect.id)
+		if(videoEntry?.sprite) {
 			const videoTexture = this.#videoElements.get(effect.id)!
-			video.texture = videoTexture
-			video.texture.update()
+			videoEntry.sprite.texture = videoTexture
+			videoEntry.sprite.texture.baseTexture.update()
 		}
 	}
 
 	draw_decoded_frame(effect: VideoEffect, frame: VideoFrame) {
-		const video = this.get(effect.id)?.sprite
-		if(video) {
+		const videoEntry = this.get(effect.id)
+		if(videoEntry?.sprite) {
 			const canvas = this.#effect_canvas.get(effect.id)!
-			canvas.width = video.width
-			canvas.height = video.height
-			canvas.getContext("2d")!.drawImage(frame, 0,0, video.width, video.height)
+			canvas.width = videoEntry.sprite.width
+			canvas.height = videoEntry.sprite.height
+			canvas.getContext("2d")!.drawImage(frame, 0, 0, videoEntry.sprite.width, videoEntry.sprite.height)
 			const texture = Texture.from(canvas)
-			video.texture = texture
-			video.texture.update()
+			videoEntry.sprite.texture = texture
+			videoEntry.sprite.texture.baseTexture.update()
 		}
 	}
 
 	pause_videos() {
 		for(const effect of this.compositor.currently_played_effects.values()) {
 			if(effect.kind === "video") {
-				const video = this.get(effect.id)?.sprite
-				if(video) {
-					const element = (video.texture.baseTexture.resource as any).source as HTMLVideoElement
-					element.pause()
+				const videoEntry = this.get(effect.id)
+				if(videoEntry?.element) {
+					videoEntry.element.pause()
 				}
 			}
 		}
@@ -160,30 +185,58 @@ export class VideoManager extends Map<string, {sprite: PIXISprite, transformer: 
 	async play_videos() {
 		for(const effect of this.compositor.currently_played_effects.values()) {
 			if(effect.kind === "video") {
-				const video = this.get(effect.id)?.sprite
-				if(video) {
-					const element = (video.texture.baseTexture.resource as any).source as HTMLVideoElement
+				const videoEntry = this.get(effect.id)
+				if(videoEntry?.element) {
 					const isMuted = isEffectMuted(effect)
-					element.muted = isMuted
-					await element.play()
+					videoEntry.element.muted = isMuted
+					try {
+						await videoEntry.element.play()
+						// Enable auto-update when playing
+						videoEntry.videoResource.autoUpdate = true
+					} catch (err) {
+						console.error('[VideoManager] Failed to play video:', err)
+					}
 				}
 			}
 		}
 	}
 
 	pause_video(effect: VideoEffect) {
-		const video = this.get(effect.id)?.sprite
-		if(video) {
-			const element = (video.texture.baseTexture.resource as any).source as HTMLVideoElement
-			element.pause()
+		const videoEntry = this.get(effect.id)
+		if(videoEntry?.element) {
+			videoEntry.element.pause()
+			// Disable auto-update when paused to save resources
+			videoEntry.videoResource.autoUpdate = false
 		}
 	}
 
 	async play_video(effect: VideoEffect) {
-		const video = this.get(effect.id)?.sprite
-		if(video) {
-			const element = (video.texture.baseTexture.resource as any).source as HTMLVideoElement
-			await element.play()
+		const videoEntry = this.get(effect.id)
+		if(videoEntry?.element) {
+			try {
+				await videoEntry.element.play()
+				// Enable auto-update when playing
+				videoEntry.videoResource.autoUpdate = true
+			} catch (err) {
+				console.error('[VideoManager] Failed to play video:', err)
+			}
+		}
+	}
+
+	/**
+	 * Update all video textures for the current frame
+	 * This is necessary because PIXI video textures need to be manually updated
+	 * when using autoPlay = false
+	 */
+	update_video_textures() {
+		for(const effect of this.compositor.currently_played_effects.values()) {
+			if(effect.kind === "video") {
+				const videoEntry = this.get(effect.id)
+				if(videoEntry?.videoResource) {
+					// Manually trigger update to refresh the texture
+					videoEntry.videoResource.update()
+				}
+			}
 		}
 	}
 }
