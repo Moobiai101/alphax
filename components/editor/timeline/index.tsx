@@ -41,6 +41,7 @@ import { useTimelineStore } from "@/lib/stores/timeline-store";
 import { useMediaStore } from "@/lib/stores/media-store";
 import { usePlaybackStore } from "@/lib/stores/playback-store";
 import { DEFAULT_FPS, useProjectStore } from "@/lib/stores/project-store";
+import { useEngine, useEngineState } from "@/components/providers/engine-provider";
 
 import { useTimelineZoom } from "@/lib/hooks/use-timeline-zoom";
 import { processMediaFiles } from "@/lib/media-processing";
@@ -86,7 +87,31 @@ export function Timeline() {
   } = useTimelineStore();
   const { mediaFiles, addMediaFile } = useMediaStore();
   const { activeProject } = useProjectStore();
-  const { currentTime, duration, seek, setDuration } = usePlaybackStore();
+  const engine = useEngine();
+  
+  // ENGINE IS THE SINGLE SOURCE OF TRUTH - read timecode directly from engine
+  const engineTimecode = useEngineState((state) => state.timecode);
+  const engineIsPlaying = useEngineState((state) => state.is_playing);
+  
+  // Convert engine timecode (ms) to seconds for Zustand display
+  const currentTime = engineTimecode / 1000;
+  
+  // Zustand duration for timeline display
+  const { duration, setDuration } = usePlaybackStore();
+  
+  // Seek function that updates ENGINE directly (like Omniclip does)
+  const seek = useCallback((timeSec: number) => {
+    const timeMs = timeSec * 1000;
+    // Pause if playing (like Omniclip does when dragging playhead)
+    if (engineIsPlaying) {
+      engine.pause();
+    }
+    // Update engine directly - engine.seek handles set_timecode + compositor.seek
+    engine.seek(timeMs);
+    // Also update Zustand for UI consistency
+    usePlaybackStore.getState().seek(timeSec);
+  }, [engine, engineIsPlaying]);
+  
   const { getRenderStatus } = useFrameCache();
   const [isDragOver, setIsDragOver] = useState(false);
   const { addElementToNewTrack } = useTimelineStore();

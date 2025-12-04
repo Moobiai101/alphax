@@ -162,12 +162,19 @@ export function alphaxToOmniclip(
   // - end: where to stop playing within the media (duration - trimEnd)
   // The effect visibility formula is: start_at_position + (end - start)
   // So effective duration on timeline = end - start = (duration - trimEnd) - trimStart
+  
+  // CRITICAL: Convert Alphax SECONDS to Omniclip MILLISECONDS
+  const startTimeMs = element.startTime * 1000;
+  const durationMs = element.duration * 1000;
+  const trimStartMs = element.trimStart * 1000;
+  const trimEndMs = element.trimEnd * 1000;
+
   const baseEffect = {
     id: element.id,
-    start_at_position: element.startTime,
-    duration: element.duration,
-    start: element.trimStart,
-    end: element.duration - element.trimEnd, // End point within media, NOT trimEnd!
+    start_at_position: startTimeMs,
+    duration: durationMs,
+    start: trimStartMs,
+    end: durationMs - trimEndMs, // End point within media, NOT trimEnd!
     track: trackIndex,
   };
 
@@ -238,8 +245,8 @@ export function alphaxToOmniclip(
         file_hash: fileHash,
         name: element.name,
         thumbnail: mediaFile.thumbnailUrl || '',
-        raw_duration: mediaFile.duration || element.duration,
-        frames: Math.round((mediaFile.fps || 30) * (mediaFile.duration || element.duration) / 1000),
+        raw_duration: mediaFile.duration || durationMs, // Use ms duration
+        frames: Math.round((mediaFile.fps || 30) * (mediaFile.duration || durationMs) / 1000),
         rect: createDefaultRect(mediaFile.width, mediaFile.height),
       };
       return videoEffect;
@@ -262,7 +269,7 @@ export function alphaxToOmniclip(
         kind: 'audio',
         file_hash: fileHash,
         name: element.name,
-        raw_duration: mediaFile.duration || element.duration,
+        raw_duration: mediaFile.duration || durationMs, // Use ms duration
       };
       return audioEffect;
     }
@@ -275,8 +282,8 @@ export function alphaxToOmniclip(
     file_hash: fileHash,
     name: element.name,
     thumbnail: '',
-    raw_duration: element.duration,
-    frames: Math.round(30 * element.duration / 1000), // Assume 30fps
+    raw_duration: durationMs, // Use ms duration
+    frames: Math.round(30 * durationMs / 1000), // Assume 30fps
     rect: createDefaultRect(),
   };
   
@@ -302,13 +309,21 @@ export function omniclipToAlphax(
   // - effect.start = trimStart (where playback starts in media)
   // - effect.end = duration - trimEnd (where playback ends in media)
   // So: trimEnd = duration - effect.end
+  
+  // CRITICAL: Convert Omniclip MILLISECONDS to Alphax SECONDS
+  const durationSec = effect.duration / 1000;
+  const startTimeSec = effect.start_at_position / 1000;
+  const trimStartSec = effect.start / 1000;
+  // effect.end is also in ms, so (duration - end) gives trimEnd in ms, divide by 1000 for seconds
+  const trimEndSec = (effect.duration - effect.end) / 1000;
+
   const baseElement = {
     id: effect.id,
     name: 'name' in effect ? effect.name : 'Untitled',
-    duration: effect.duration,
-    startTime: effect.start_at_position,
-    trimStart: effect.start,
-    trimEnd: effect.duration - effect.end, // Convert back from end point to trimEnd
+    duration: durationSec,
+    startTime: startTimeSec,
+    trimStart: trimStartSec,
+    trimEnd: trimEndSec,
   };
 
   // Convert based on effect kind

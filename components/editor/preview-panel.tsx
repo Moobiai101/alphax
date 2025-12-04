@@ -13,7 +13,7 @@ import { useMediaStore } from "@/lib/stores/media-store";
 import { usePlaybackStore } from "@/lib/stores/playback-store";
 import { useProjectStore, DEFAULT_CANVAS_SIZE } from "@/lib/stores/project-store";
 import { useSceneStore } from "@/lib/stores/scene-store";
-import { useEngine, useEnginePlayback } from "@/components/providers/engine-provider";
+import { useEngine, useEngineState } from "@/components/providers/engine-provider";
 import { Button } from "@/components/ui/button";
 import { Play, Pause, Expand, SkipBack, SkipForward } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -35,8 +35,17 @@ export function PreviewPanel() {
   const { currentScene } = useSceneStore();
   const engine = useEngine();
   
-  // Use engine playback, but keep Zustand as source of truth for UI
-  const { currentTime: zustandCurrentTime, isPlaying: zustandIsPlaying, toggle, setCurrentTime } = usePlaybackStore();
+  // ENGINE IS THE SINGLE SOURCE OF TRUTH - subscribe directly to engine state
+  // Following Omniclip pattern: UI reads from engine.state directly
+  const engineState = useEngineState((state) => ({
+    timecode: state.timecode,
+    isPlaying: state.is_playing,
+    effects: state.effects,
+  }));
+  
+  // Keep Zustand only for UI controls (volume, speed) and for timeline display
+  // But engine drives the actual playback
+  const { toggle, setCurrentTime } = usePlaybackStore();
   
   const pixiContainerRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -44,7 +53,6 @@ export function PreviewPanel() {
   const [isExpanded, setIsExpanded] = useState(false);
   const canvasSize = activeProject?.canvasSize || DEFAULT_CANVAS_SIZE;
   const isMounted = useRef(false);
-  const syncLock = useRef(false);
 
   // Sync media to engine
   useEffect(() => {
@@ -60,66 +68,34 @@ export function PreviewPanel() {
     sync();
   }, [engine, mediaFiles]);
 
-  // Sync Zustand state to engine (one-way: Zustand -> Engine)
-  useEffect(() => {
-    if (syncLock.current) return;
-    
-    // Guard: check if engine is ready
-    try {
-      const compositor = engine.controllers.compositor;
-      if (compositor.isDestroyed) return;
-      
-    // Sync playback state
-    if (zustandIsPlaying !== engine.isPlaying()) {
-      syncLock.current = true;
-      if (zustandIsPlaying) {
-        engine.play();
-      } else {
-        engine.pause();
-      }
-      syncLock.current = false;
-      }
-    } catch (e) {
-      // Engine not ready or destroyed
-    }
-  }, [zustandIsPlaying, engine]);
+  // === FOLLOW OMNICLIP PATTERN EXACTLY ===
+  // Following omniclip/s/components/omni-timeline/views/media-player/view.ts pattern
+  // NOTE: Playback sync is handled synchronously in toggle handler to avoid race conditions
 
+  // 2. Watch timecode changes when PAUSED (user seeking/dragging playhead)
   useEffect(() => {
-    if (syncLock.current) return;
+    if (!engine) return;
+    if (engineState.isPlaying) return; // Skip during playback - compositor handles it internally
     
-    // Guard: check if engine is ready
-    try {
-      const compositor = engine.controllers.compositor;
-      if (compositor.isDestroyed) return;
-      
-      // Only sync time when NOT playing - during playback, engine controls time
-      // This prevents sync loops that cause timecode jumps
-      if (zustandIsPlaying) {
-        console.log('[PreviewPanel] Skipping time sync during playback - engine controls time');
-        return;
+    const compositor = engine.controllers.compositor;
+    if (compositor.isDestroyed) return;
+    
+    const state = engine.getState();
+    const timecode = engineState.timecode;
+    
+    // When paused and timecode changes (user dragged playhead), update preview
+    // Following Omniclip pattern EXACTLY: compose_effects THEN seek THEN compose_effects again
+    compositor.compose_effects(state.effects, timecode);
+    compositor.seek(timecode, true).then(() => {
+      if (!compositor.isDestroyed) {
+        compositor.compose_effects(state.effects, timecode);
       }
-      
-      // Sync current time and compose effects when seeking (paused only)
-      const engineTime = engine.getCurrentTime();
-      if (Math.abs(zustandCurrentTime - engineTime) > 16) { // > 16ms difference
-        syncLock.current = true;
-        engine.seek(zustandCurrentTime);
-        
-        // Compose effects at the new timecode (critical for showing video frames when paused)
-        const state = engine.getState();
-        compositor.compose_effects(state.effects, zustandCurrentTime);
-        compositor.seek(zustandCurrentTime, true).then(() => {
-          if (!compositor.isDestroyed) {
-            compositor.compose_effects(state.effects, zustandCurrentTime);
-          }
-        });
-        
-        syncLock.current = false;
-      }
-    } catch (e) {
-      // Engine not ready or destroyed
-    }
-  }, [zustandCurrentTime, engine, zustandIsPlaying]);
+    });
+  }, [engine, engineState.timecode, engineState.isPlaying]);
+  
+  // NOTE: We do NOT subscribe to compositor.on_playing because:
+  // - Compositor already calls compose_effects internally in #on_playing (line 152)
+  // - Omniclip's subscription is redundant but harmless - we'll avoid it for performance
 
   // Track pending media for retry
   const pendingMediaRef = useRef<Set<string>>(new Set());
@@ -401,14 +377,20 @@ export function PreviewPanel() {
   const shouldRenderPreview = previewDimensions.width > 0 && previewDimensions.height > 0;
 
   const handleSkipBackward = () => {
-    const newTime = Math.max(0, zustandCurrentTime - 1000);
-    setCurrentTime(newTime);
+    const currentTimeSec = engineState.timecode / 1000;
+    const newTimeSec = Math.max(0, currentTimeSec - 1);
+    const newTimeMs = newTimeSec * 1000;
+    engine.seek(newTimeMs);
+    setCurrentTime(newTimeSec);
   };
 
   const handleSkipForward = () => {
-    const duration = getTotalDuration();
-    const newTime = Math.min(duration, zustandCurrentTime + 1000);
-    setCurrentTime(newTime);
+    const durationSec = getTotalDuration() / 1000;
+    const currentTimeSec = engineState.timecode / 1000;
+    const newTimeSec = Math.min(durationSec, currentTimeSec + 1);
+    const newTimeMs = newTimeSec * 1000;
+    engine.seek(newTimeMs);
+    setCurrentTime(newTimeSec);
   };
 
   const toggleExpanded = useCallback(() => {
@@ -439,13 +421,29 @@ export function PreviewPanel() {
           <PreviewToolbar
             hasAnyElements={hasAnyElements}
             onToggleExpanded={toggleExpanded}
-            currentTime={zustandCurrentTime}
-            setCurrentTime={setCurrentTime}
-            toggle={toggle}
+            currentTime={engineState.timecode / 1000}
+            setCurrentTime={(timeSec) => {
+              const timeMs = timeSec * 1000;
+              engine.seek(timeMs);
+              setCurrentTime(timeSec);
+            }}
+            toggle={() => {
+              const compositor = engine.controllers.compositor;
+              const state = engine.getState();
+              
+              // CRITICAL: If starting playback, sync compositor timecode FIRST
+              if (!engineState.isPlaying) {
+                compositor.compose_effects(state.effects, state.timecode);
+                compositor.seek(state.timecode, false);
+              }
+              
+              engine.togglePlayback();
+              toggle();
+            }}
             getTotalDuration={getTotalDuration}
             handleSkipBackward={handleSkipBackward}
             handleSkipForward={handleSkipForward}
-            isPlaying={zustandIsPlaying}
+            isPlaying={engineState.isPlaying}
           />
         </div>
       </div>
@@ -480,13 +478,34 @@ export function PreviewPanel() {
         <PreviewToolbar
           hasAnyElements={hasAnyElements}
           onToggleExpanded={toggleExpanded}
-          currentTime={zustandCurrentTime}
-          setCurrentTime={setCurrentTime}
-          toggle={toggle}
+          currentTime={engineState.timecode / 1000} // Convert ms to seconds for display
+          setCurrentTime={(timeSec) => {
+            // Convert seconds to milliseconds and update engine directly
+            const timeMs = timeSec * 1000;
+            engine.seek(timeMs);
+            // Also update Zustand for timeline display
+            setCurrentTime(timeSec);
+          }}
+          toggle={() => {
+            const compositor = engine.controllers.compositor;
+            const state = engine.getState();
+            
+            // CRITICAL: If starting playback, sync compositor timecode FIRST
+            // This must happen synchronously before compositor's next frame
+            if (!engineState.isPlaying) {
+              compositor.compose_effects(state.effects, state.timecode);
+              compositor.seek(state.timecode, false);
+            }
+            
+            // Toggle engine playback directly
+            engine.togglePlayback();
+            // Also toggle Zustand for UI consistency
+            toggle();
+          }}
           getTotalDuration={getTotalDuration}
           handleSkipBackward={handleSkipBackward}
           handleSkipForward={handleSkipForward}
-          isPlaying={zustandIsPlaying}
+          isPlaying={engineState.isPlaying}
         />
       </div>
     </div>

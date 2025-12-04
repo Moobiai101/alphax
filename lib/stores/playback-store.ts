@@ -6,63 +6,37 @@ import { DEFAULT_FPS, useProjectStore } from "./project-store";
 interface PlaybackStore extends PlaybackState, PlaybackControls {
   setDuration: (duration: number) => void;
   setCurrentTime: (time: number) => void;
+  // Internal method for engine to update time without triggering seek events
+  _engineUpdateTime: (time: number) => void;
+  // Flag to indicate if engine is controlling time (during playback)
+  _engineControlsTime: boolean;
 }
+
+/**
+ * ARCHITECTURE NOTE: Engine-Driven Playback
+ * 
+ * This store follows industry-standard video editor architecture where the rendering
+ * engine is the master clock during playback. The flow is:
+ * 
+ * 1. User interactions (play/pause/seek) → Zustand Store → Engine
+ * 2. During playback: Engine drives time → Zustand Store → UI updates (timeline playhead, preview)
+ * 3. Engine updates are pushed via subscription to _engineUpdateTime()
+ * 
+ * Time Units:
+ * - Zustand Store: SECONDS (matches HTML5 video/audio elements)
+ * - Engine: MILLISECONDS (Omniclip internal format)
+ * - Conversion happens at the engine boundary in PreviewPanel
+ * 
+ * The legacy timer code below is DEPRECATED and no longer used.
+ */
 
 let playbackTimer: number | null = null;
 
 const startTimer = (store: () => PlaybackStore) => {
+  // DEPRECATED: This timer-based playback is no longer used
+  // The engine now drives time updates via _engineUpdateTime
   if (playbackTimer) cancelAnimationFrame(playbackTimer);
-
-  // Use requestAnimationFrame for smoother updates
-  const updateTime = () => {
-    const state = store();
-    if (state.isPlaying && state.currentTime < state.duration) {
-      const now = performance.now();
-      const delta = (now - lastUpdate) / 1000; // Convert to seconds
-      lastUpdate = now;
-
-      const newTime = state.currentTime + delta * state.speed;
-
-      // Get actual content duration from timeline store
-      const actualContentDuration = useTimelineStore
-        .getState()
-        .getTotalDuration();
-
-      // Stop at actual content end, not timeline duration (which has 10s minimum)
-      // It was either this or reducing default min timeline to 1 second
-      const effectiveDuration =
-        actualContentDuration > 0 ? actualContentDuration : state.duration;
-
-      if (newTime >= effectiveDuration) {
-        // When content completes, pause just before the end so we can see the last frame
-        const projectFps = useProjectStore.getState().activeProject?.fps;
-        if (!projectFps)
-          console.error("Project FPS is not set, assuming " + DEFAULT_FPS + "fps");
-
-        const frameOffset = 1 / (projectFps ?? DEFAULT_FPS); // Stop 1 frame before end based on project FPS
-        const stopTime = Math.max(0, effectiveDuration - frameOffset);
-
-        state.pause();
-        state.setCurrentTime(stopTime);
-        // Notify video elements to sync with end position
-        window.dispatchEvent(
-          new CustomEvent("playback-seek", {
-            detail: { time: stopTime },
-          })
-        );
-      } else {
-        state.setCurrentTime(newTime);
-        // Notify video elements to sync
-        window.dispatchEvent(
-          new CustomEvent("playback-update", { detail: { time: newTime } })
-        );
-      }
-    }
-    playbackTimer = requestAnimationFrame(updateTime);
-  };
-
-  let lastUpdate = performance.now();
-  playbackTimer = requestAnimationFrame(updateTime);
+  playbackTimer = null;
 };
 
 const stopTimer = () => {
@@ -80,6 +54,7 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
   muted: false,
   previousVolume: 1,
   speed: 1.0,
+  _engineControlsTime: false,
 
   play: () => {
     const state = get();
@@ -100,12 +75,13 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
       }
     }
 
-    set({ isPlaying: true });
-    startTimer(get);
+    // Set engine controls time flag - engine will now drive time updates
+    set({ isPlaying: true, _engineControlsTime: true });
+    stopTimer(); // Ensure our old timer is stopped
   },
 
   pause: () => {
-    set({ isPlaying: false });
+    set({ isPlaying: false, _engineControlsTime: false });
     stopTimer();
   },
 
@@ -123,10 +99,38 @@ export const usePlaybackStore = create<PlaybackStore>((set, get) => ({
     const clampedTime = Math.max(0, Math.min(duration, time));
     set({ currentTime: clampedTime });
 
+    // Dispatch seek event for video/audio elements and engine
     const event = new CustomEvent("playback-seek", {
       detail: { time: clampedTime },
     });
     window.dispatchEvent(event);
+  },
+
+  // Internal method for engine to update time during playback
+  // This bypasses the seek event dispatch to prevent circular updates
+  _engineUpdateTime: (time: number) => {
+    const state = get();
+    // Only accept engine time updates during playback
+    if (!state._engineControlsTime) return;
+    
+    set({ currentTime: time });
+    
+    // Dispatch update event for video/audio elements (not seek, which would trigger engine)
+    window.dispatchEvent(
+      new CustomEvent("playback-update", { detail: { time } })
+    );
+
+    // Check if we've reached the end
+    const actualContentDuration = useTimelineStore
+      .getState()
+      .getTotalDuration();
+    const effectiveDuration =
+      actualContentDuration > 0 ? actualContentDuration : state.duration;
+    
+    if (time >= effectiveDuration) {
+      // Pause at the end
+      state.pause();
+    }
   },
 
   setVolume: (volume: number) =>
