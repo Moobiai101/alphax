@@ -275,27 +275,14 @@ export function PreviewPanel() {
 
         console.log('✅ PIXI canvas mounted successfully');
 
-        // Subscribe to compositor's on_playing event to compose effects on each frame
-        // This is critical for video playback - mirrors omniclip's MediaPlayer behavior
-        // pub() returns a function that takes a listener and returns an unsubscribe function
-        const unsubOnPlaying = compositor.on_playing(() => {
-          // Guard against destroyed compositor
-          if (compositor.isDestroyed) return;
-          
-          try {
-            const state = engine.getState();
-            if (!state.is_exporting) {
-              compositor.compose_effects(state.effects, state.timecode);
-            }
-          } catch (e) {
-            // Engine destroyed during callback
-          }
-        });
+        // Note: The compositor's internal #on_playing loop handles compose_effects
+        // We don't need to subscribe here - that would cause double rendering
+        // The compositor already calls compose_effects(omnislate.context.state.effects, timecode)
+        // in its animation frame loop
 
         // Store cleanup function in a ref so we can call it on unmount
         const cleanup = () => {
           console.log('[PreviewPanel] Cleaning up PIXI canvas mount');
-          unsubOnPlaying();
           if (container.contains(pixiCanvas)) {
             container.removeChild(pixiCanvas);
           }

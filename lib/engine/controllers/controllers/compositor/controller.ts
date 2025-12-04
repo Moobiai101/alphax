@@ -146,7 +146,10 @@ export class Compositor {
 			const elapsed_time = this.#calculate_elapsed_time()
 			this.actions.increase_timecode(elapsed_time, {omit: true})
 			this.on_playing.publish(0)
-			this.compose_effects([...this.currently_played_effects.values()], this.timecode)
+			// CRITICAL: Use full state effects, not currently_played_effects
+			// currently_played_effects is populated INSIDE compose_effects, so using it here
+			// would create a chicken-and-egg problem where nothing ever gets rendered
+			this.compose_effects(omnislate.context.state.effects, this.timecode)
 		}
 		this.#animationFrameId = requestAnimationFrame(this.#on_playing)
 	}

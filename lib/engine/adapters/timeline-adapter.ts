@@ -157,12 +157,17 @@ export function alphaxToOmniclip(
   const trackIndex = getTrackIndex(track.id, tracks);
   
   // Base effect properties
+  // CRITICAL: Omniclip uses start/end as the playback range WITHIN the media file:
+  // - start: where to start playing within the media (trimStart)
+  // - end: where to stop playing within the media (duration - trimEnd)
+  // The effect visibility formula is: start_at_position + (end - start)
+  // So effective duration on timeline = end - start = (duration - trimEnd) - trimStart
   const baseEffect = {
     id: element.id,
     start_at_position: element.startTime,
     duration: element.duration,
     start: element.trimStart,
-    end: element.trimEnd,
+    end: element.duration - element.trimEnd, // End point within media, NOT trimEnd!
     track: trackIndex,
   };
 
@@ -293,13 +298,17 @@ export function omniclipToAlphax(
   }
 
   // Base element properties
+  // CRITICAL: Convert back from Omniclip's start/end (range within media) to Alphax's trimStart/trimEnd
+  // - effect.start = trimStart (where playback starts in media)
+  // - effect.end = duration - trimEnd (where playback ends in media)
+  // So: trimEnd = duration - effect.end
   const baseElement = {
     id: effect.id,
     name: 'name' in effect ? effect.name : 'Untitled',
     duration: effect.duration,
     startTime: effect.start_at_position,
     trimStart: effect.start,
-    trimEnd: effect.end,
+    trimEnd: effect.duration - effect.end, // Convert back from end point to trimEnd
   };
 
   // Convert based on effect kind
