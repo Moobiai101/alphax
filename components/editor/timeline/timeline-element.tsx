@@ -32,6 +32,8 @@ import {
 } from "../../ui/context-menu";
 import { useMediaPanelStore } from "../media-panel/store";
 
+import { Filmstrip } from "./filmstrip";
+
 export function TimelineElement({
   element,
   track,
@@ -177,10 +179,39 @@ export function TimelineElement({
       (mediaItem.type === "video" && mediaItem.thumbnailUrl)
     ) {
       const trackHeight = getTrackHeight(track.type);
-      const tileWidth = trackHeight * (16 / 9);
+      const elementWidth = element.duration * 50 * zoomLevel; // Calc width in pixels
 
-      const imageUrl =
-        mediaItem.type === "image" ? mediaItem.url : mediaItem.thumbnailUrl;
+      // Video Filmstrip
+      if (mediaItem.type === "video") {
+        return (
+          <div className="w-full h-full flex items-center justify-center overflow-hidden rounded-md">
+            <div
+              className={`w-full h-full relative ${
+                isSelected ? "ring-2 ring-primary z-10" : ""
+              }`}
+            >
+              <Filmstrip
+                mediaFile={mediaItem}
+                duration={element.duration}
+                visibleDuration={element.duration}
+                width={elementWidth}
+                height={trackHeight}
+                trimStart={element.trimStart || 0}
+              />
+              {/* Overlay name for readability - with gradient background */}
+              <div className="absolute top-0 left-0 right-0 p-1 bg-linear-to-b from-black/60 to-transparent z-20">
+                 <div className="text-[10px] text-white/90 truncate font-medium">
+                  {element.name}
+                 </div>
+              </div>
+            </div>
+          </div>
+        );
+      }
+
+      // Image Tiling (Keep existing behavior for images)
+      const tileWidth = trackHeight * (16 / 9);
+      const imageUrl = mediaItem.url; // Images use their own URL
 
       return (
         <div className="w-full h-full flex items-center justify-center">
@@ -198,8 +229,11 @@ export function TimelineElement({
                 backgroundPosition: "left center",
                 pointerEvents: "none",
               }}
-              aria-label={`Tiled ${mediaItem.type === "image" ? "background" : "thumbnail"} of ${mediaItem.name}`}
+              aria-label={`Tiled background of ${mediaItem.name}`}
             />
+             <div className="absolute top-0 left-2 text-[10px] text-white/90 drop-shadow-md truncate max-w-full font-medium z-20">
+                {element.name}
+              </div>
           </div>
         </div>
       );

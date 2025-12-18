@@ -12,7 +12,9 @@ interface UseTimelinePlayheadProps {
   rulerRef: React.RefObject<HTMLDivElement | null>;
   rulerScrollRef: React.RefObject<HTMLDivElement | null>;
   tracksScrollRef: React.RefObject<HTMLDivElement | null>;
+  trackLabelsRef?: React.RefObject<HTMLDivElement | null>;
   playheadRef?: React.RefObject<HTMLDivElement | null>;
+  enableAutoScroll?: boolean;
 }
 
 export function useTimelinePlayhead({
@@ -23,19 +25,54 @@ export function useTimelinePlayhead({
   rulerRef,
   rulerScrollRef,
   tracksScrollRef,
+  trackLabelsRef,
   playheadRef,
+  enableAutoScroll = true,
 }: UseTimelinePlayheadProps) {
   // Playhead scrubbing state
   const [isScrubbing, setIsScrubbing] = useState(false);
-  const [scrubTime, setScrubTime] = useState<number | null>(null);
+  
+  // Refs for throttling and direct DOM updates
+  const rafIdRef = useRef<number | null>(null);
+  const lastTimeRef = useRef<number>(currentTime);
 
   // Ruler drag detection state
   const [isDraggingRuler, setIsDraggingRuler] = useState(false);
   const [hasDraggedRuler, setHasDraggedRuler] = useState(false);
   const lastMouseXRef = useRef<number>(0);
 
-  const playheadPosition =
-    isScrubbing && scrubTime !== null ? scrubTime : currentTime;
+  // Helper to update playhead DOM directly for 60fps performance
+  const updatePlayheadDOM = useCallback((time: number) => {
+    if (!playheadRef?.current || !tracksScrollRef.current) return;
+    
+    // TIMELINE_CONSTANTS.PIXELS_PER_SECOND = 50
+    const timelinePosition = time * 50 * zoomLevel;
+    
+    // Fallback to 112px (w-28) if ref is missing (prevents jump on first interaction)
+    const trackLabelsWidth = trackLabelsRef?.current?.offsetWidth || 112;
+    const scrollLeft = tracksScrollRef.current.scrollLeft;
+    
+    // Logic duplicated from TimelinePlayhead to ensure sync
+    const rawLeftPosition = trackLabelsWidth + timelinePosition - scrollLeft;
+    const viewportWidth = tracksScrollRef.current.clientWidth;
+    
+    // Constrain playhead
+    const timelineContentWidth = duration * 50 * zoomLevel;
+    const leftBoundary = trackLabelsWidth;
+    const rightBoundary = Math.min(
+      trackLabelsWidth + timelineContentWidth - scrollLeft,
+      trackLabelsWidth + viewportWidth
+    );
+    
+    const leftPosition = Math.max(
+      leftBoundary,
+      Math.min(rightBoundary, rawLeftPosition)
+    );
+    
+    playheadRef.current.style.left = `${leftPosition}px`;
+  }, [zoomLevel, duration, trackLabelsRef, tracksScrollRef, playheadRef]);
+
+  const playheadPosition = isScrubbing ? lastTimeRef.current : currentTime;
 
   // --- Playhead Scrubbing Handlers ---
   const handlePlayheadMouseDown = useCallback(
@@ -89,30 +126,28 @@ export function useTimelinePlayhead({
 
       // Debug logging
       if (rawX < 0 || x !== rawX) {
-        console.log(
-          "PLAYHEAD DEBUG:",
-          JSON.stringify({
-            mouseX: e.clientX,
-            rulerLeft: rect.left,
-            rawX,
-            constrainedX: x,
-            timelineContentWidth,
-            rawTime,
-            finalTime: time,
-            duration,
-            zoomLevel,
-            playheadPx: time * 50 * zoomLevel,
-          })
-        );
+        // Reduced logging frequency or removed for production
       }
 
-      setScrubTime(time);
-      seek(time); // update video preview in real time
+      // 1. Direct DOM update for instant feedback (no React render)
+      lastTimeRef.current = time;
+      updatePlayheadDOM(time);
+
+      // 2. Throttle seek calls to avoid engine overload
+      if (rafIdRef.current === null) {
+        rafIdRef.current = requestAnimationFrame(() => {
+          // If seeking is expensive, check if we really need to seek
+          // Only seek if time has changed significantly enough (e.g. > 1/60s)
+          // For now, simple RAF throttling is usually sufficient.
+          seek(time);
+          rafIdRef.current = null;
+        });
+      }
 
       // Store mouse position for auto-scrolling
       lastMouseXRef.current = e.clientX;
     },
-    [duration, zoomLevel, seek, rulerRef]
+    [duration, zoomLevel, seek, rulerRef, updatePlayheadDOM]
   );
 
   useEdgeAutoScroll({
@@ -137,8 +172,16 @@ export function useTimelinePlayhead({
 
     const onMouseUp = (e: MouseEvent) => {
       setIsScrubbing(false);
-      if (scrubTime !== null) seek(scrubTime); // finalize seek
-      setScrubTime(null);
+      // Ensure final seek is accurate
+      if (lastTimeRef.current !== null) {
+         seek(lastTimeRef.current);
+      }
+      
+      // Cancel any pending RAF
+      if (rafIdRef.current !== null) {
+        cancelAnimationFrame(rafIdRef.current);
+        rafIdRef.current = null;
+      }
 
       // Handle ruler click vs drag
       if (isDraggingRuler) {
@@ -163,7 +206,6 @@ export function useTimelinePlayhead({
     };
   }, [
     isScrubbing,
-    scrubTime,
     seek,
     handleScrub,
     isDraggingRuler,
@@ -173,6 +215,8 @@ export function useTimelinePlayhead({
 
   // --- Playhead auto-scroll effect (only during playback) ---
   useEffect(() => {
+    if (!enableAutoScroll) return;
+
     const { isPlaying } = usePlaybackStore.getState();
 
     // Only auto-scroll during playback, not during manual interactions

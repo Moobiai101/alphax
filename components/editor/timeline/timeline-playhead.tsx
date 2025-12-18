@@ -4,9 +4,10 @@ import { useRef, useState, useEffect } from "react";
 import { TimelineTrack } from "@/types/timeline";
 import { TIMELINE_CONSTANTS } from "@/lib/timeline-constants";
 import { useTimelinePlayhead } from "@/lib/hooks/use-timeline-playhead";
+import { useEngineState } from "@/components/providers/engine-provider";
 
 interface TimelinePlayheadProps {
-  currentTime: number;
+  currentTime?: number;
   duration: number;
   zoomLevel: number;
   tracks: TimelineTrack[];
@@ -21,7 +22,7 @@ interface TimelinePlayheadProps {
 }
 
 export function TimelinePlayhead({
-  currentTime,
+  currentTime: propCurrentTime,
   duration,
   zoomLevel,
   tracks,
@@ -36,7 +37,14 @@ export function TimelinePlayhead({
 }: TimelinePlayheadProps) {
   const internalPlayheadRef = useRef<HTMLDivElement>(null);
   const playheadRef = externalPlayheadRef || internalPlayheadRef;
-  const [scrollLeft, setScrollLeft] = useState(0);
+  const [scrollLeft, setScrollLeft] = useState(0); // Kept locally only for initial mount if needed, but we rely on ref mostly
+
+  // Subscribe to engine time directly to avoid parent re-renders
+  const engineTimecode = useEngineState((state) => state.timecode);
+  const engineCurrentTime = engineTimecode / 1000;
+  
+  // Use prop if provided (legacy), otherwise use engine time
+  const currentTime = propCurrentTime ?? engineCurrentTime;
 
   const { playheadPosition, handlePlayheadMouseDown } = useTimelinePlayhead({
     currentTime,
@@ -46,51 +54,83 @@ export function TimelinePlayhead({
     rulerRef,
     rulerScrollRef,
     tracksScrollRef,
+    trackLabelsRef,
     playheadRef,
+    enableAutoScroll: true,
   });
 
   // Track scroll position to lock playhead to frame
+  // OPTIMIZED: Use direct DOM manipulation on scroll instead of state to avoid re-renders
   useEffect(() => {
     const tracksViewport = tracksScrollRef.current;
-
-    if (!tracksViewport) return;
+    if (!tracksViewport || !playheadRef.current) return;
 
     const handleScroll = () => {
-      setScrollLeft(tracksViewport.scrollLeft);
+      // Direct DOM update on scroll
+      const currentScrollLeft = tracksViewport.scrollLeft;
+      
+      // Re-calculate position
+      const trackLabelsWidth = trackLabelsRef?.current?.offsetWidth || 0;
+      const timelinePosition = playheadPosition * TIMELINE_CONSTANTS.PIXELS_PER_SECOND * zoomLevel;
+      const rawLeftPosition = trackLabelsWidth + timelinePosition - currentScrollLeft;
+      
+      // Boundaries
+      const viewportWidth = tracksViewport.clientWidth;
+      const timelineContentWidth = duration * TIMELINE_CONSTANTS.PIXELS_PER_SECOND * zoomLevel;
+      const leftBoundary = trackLabelsWidth;
+      const rightBoundary = Math.min(
+        trackLabelsWidth + timelineContentWidth - currentScrollLeft,
+        trackLabelsWidth + viewportWidth
+      );
+      
+      const leftPosition = Math.max(
+        leftBoundary,
+        Math.min(rightBoundary, rawLeftPosition)
+      );
+      
+      playheadRef.current!.style.left = `${leftPosition}px`;
+      
+      // Update state only if we need to sync for some reason, but we try to avoid it
+      // setScrollLeft(currentScrollLeft); 
     };
-
-    // Set initial scroll position
-    setScrollLeft(tracksViewport.scrollLeft);
+    
+    // Initial sync
+    handleScroll();
 
     tracksViewport.addEventListener("scroll", handleScroll);
     return () => tracksViewport.removeEventListener("scroll", handleScroll);
-  }, [tracksScrollRef]);
+  }, [tracksScrollRef, playheadRef, trackLabelsRef, playheadPosition, zoomLevel, duration]);
 
   // Use timeline container height minus a few pixels for breathing room
   const timelineContainerHeight = timelineRef.current?.offsetHeight || 400;
   const totalHeight = timelineContainerHeight - 4;
-
-  // Get dynamic track labels width, fallback to 0 if no tracks or no ref
+  
+  // Initial render calculation (fallback/server-side)
+  // We use 0 for scrollLeft initially, but the useEffect will correct it immediately
+  const initialScrollLeft = tracksScrollRef.current?.scrollLeft || 0;
+  
+  // Get dynamic track labels width
+  // Fallback to 112px (w-28) if ref is not yet available but tracks exist
+  // This prevents playhead jumping on initial render or when tracks are added
   const trackLabelsWidth =
-    tracks.length > 0 && trackLabelsRef?.current
-      ? trackLabelsRef.current.offsetWidth
+    tracks.length > 0 
+      ? (trackLabelsRef?.current?.offsetWidth || 112)
       : 0;
 
-  // Calculate position locked to timeline content (accounting for scroll)
+  // Calculate position locked to timeline content
   const timelinePosition =
     playheadPosition * TIMELINE_CONSTANTS.PIXELS_PER_SECOND * zoomLevel;
-  const rawLeftPosition = trackLabelsWidth + timelinePosition - scrollLeft;
+  const rawLeftPosition = trackLabelsWidth + timelinePosition - initialScrollLeft;
 
   // Get the timeline content width and viewport width for right boundary
   const timelineContentWidth =
     duration * TIMELINE_CONSTANTS.PIXELS_PER_SECOND * zoomLevel;
-  const tracksViewport = tracksScrollRef.current;
-  const viewportWidth = tracksViewport?.clientWidth || 1000;
+  const viewportWidth = tracksScrollRef.current?.clientWidth || 1000;
 
   // Constrain playhead to never appear outside the timeline area
   const leftBoundary = trackLabelsWidth;
   const rightBoundary = Math.min(
-    trackLabelsWidth + timelineContentWidth - scrollLeft, // Don't go beyond timeline content
+    trackLabelsWidth + timelineContentWidth - initialScrollLeft, // Don't go beyond timeline content
     trackLabelsWidth + viewportWidth // Don't go beyond viewport
   );
 
@@ -98,26 +138,6 @@ export function TimelinePlayhead({
     leftBoundary,
     Math.min(rightBoundary, rawLeftPosition)
   );
-
-  // Debug logging when playhead might go outside
-  if (rawLeftPosition < leftBoundary || rawLeftPosition > rightBoundary) {
-    console.log(
-      "PLAYHEAD VISUAL DEBUG:",
-      JSON.stringify({
-        playheadPosition,
-        timelinePosition,
-        trackLabelsWidth,
-        scrollLeft,
-        rawLeftPosition,
-        constrainedLeftPosition: leftPosition,
-        leftBoundary,
-        rightBoundary,
-        timelineContentWidth,
-        viewportWidth,
-        zoomLevel,
-      })
-    );
-  }
 
   return (
     <div

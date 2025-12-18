@@ -195,7 +195,8 @@ export function alphaxToOmniclip(
       fill: [textElement.color],
       fillGradientType: 0, // No gradient by default
       fillGradientStops: [],
-      stroke: { color: 'transparent', width: 0 },
+      // Correct stroke to use only a color string, as required by type
+      stroke: 'transparent',
       strokeThickness: 0,
       lineJoin: 'miter',
       miterLimit: 10,

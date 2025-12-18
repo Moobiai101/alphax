@@ -214,7 +214,7 @@ export class Compositor {
 
 	compose_effects(effects: AnyEffect[], timecode: number, exporting?: boolean) {
 		if(!this.#recreated) {
-			console.log('[Compositor.compose_effects] Skipping - not recreated yet')
+			// console.log('[Compositor.compose_effects] Skipping - not recreated yet')
 			return
 		}
 		this.timecode = timecode
@@ -225,7 +225,7 @@ export class Compositor {
 		// when autoPlay is disabled
 		this.managers.videoManager.update_video_textures()
 		
-		console.log('[Compositor.compose_effects] Rendering at timecode:', timecode, 'currently_played_effects:', this.currently_played_effects.size, 'stage children:', this.app.stage.children.length)
+		// console.log('[Compositor.compose_effects] Rendering at timecode:', timecode, 'currently_played_effects:', this.currently_played_effects.size, 'stage children:', this.app.stage.children.length)
 		this.app.render()
 	}
 
