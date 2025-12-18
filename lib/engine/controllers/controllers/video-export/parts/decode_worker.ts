@@ -23,12 +23,7 @@ const decoder = new VideoDecoder({
 	error: (e) => console.log(e)
 })
 
-const interval = setInterval(async()  => {
-	if(timestamp >= timestamp_end) {
-		await wait(5) // wait in case some more frames
-		self.postMessage({action: "end"})
-	}
-}, 100)
+let endCheckInterval: ReturnType<typeof setInterval> | null = null
 
 decoder.addEventListener("dequeue", () => {
 	self.postMessage({action: "dequeue", size: decoder.decodeQueueSize})
@@ -43,6 +38,21 @@ self.addEventListener("message", async message => {
 		end = message.data.props.end
 		id = message.data.props.id
 		timestamp_end = (message.data.starting_timestamp) + (message.data.props.end - message.data.props.start)
+		
+		// Start checking for end condition
+		if (endCheckInterval) {
+			clearInterval(endCheckInterval)
+		}
+		endCheckInterval = setInterval(async() => {
+			if(timestamp >= timestamp_end) {
+				await wait(5) // wait in case some more frames
+				self.postMessage({action: "end"})
+				if (endCheckInterval) {
+					clearInterval(endCheckInterval)
+					endCheckInterval = null
+				}
+			}
+		}, 100)
 	}
 	if(message.data.action === "configure") {
 		decoder.configure(message.data.config)
@@ -50,6 +60,14 @@ self.addEventListener("message", async message => {
 	}
 	if(message.data.action === "chunk") {
 		decoder.decode(message.data.chunk)
+	}
+	if(message.data.action === "cleanup") {
+		// Clean up resources when worker is about to terminate
+		if (endCheckInterval) {
+			clearInterval(endCheckInterval)
+			endCheckInterval = null
+		}
+		decoder.close()
 	}
 })
 

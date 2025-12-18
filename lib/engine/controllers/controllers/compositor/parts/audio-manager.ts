@@ -8,7 +8,7 @@ import {isEffectMuted} from "../utils/is_effect_muted"
 import {Audio} from "../../../../types/media-types"
 import {find_place_for_new_effect} from "../../timeline/utils/find_place_for_new_effect"
 
-export class AudioManager extends Map<string, HTMLAudioElement> {
+export class AudioManager extends Map<string, HTMLAudioElement & { objectUrl?: string }> {
 
 	constructor(private compositor: Compositor, private actions: Actions) {super()}
 
@@ -35,14 +35,34 @@ export class AudioManager extends Map<string, HTMLAudioElement> {
 	}
 
 	add_audio_effect(effect: AudioEffect, file: File, recreate?: boolean) {
+		if (this.has(effect.id)) {
+			this.cleanup_effect(effect.id)
+		}
 		const audio = document.createElement("audio")
 		const source = document.createElement("source")
+		const objectUrl = URL.createObjectURL(file)
 		source.type = "audio/mp3"
-		source.src = URL.createObjectURL(file)
+		source.src = objectUrl
 		audio.append(source)
-		this.set(effect.id, audio)
+		
+		const audioEntry = audio as HTMLAudioElement & { objectUrl?: string }
+		audioEntry.objectUrl = objectUrl
+		this.set(effect.id, audioEntry)
+		
 		if(recreate) {return}
 		this.actions.add_audio_effect(effect)
+	}
+
+	cleanup_effect(id: string) {
+		const element = this.get(id)
+		if(element) {
+			element.pause()
+			element.src = ""
+			if (element.objectUrl) {
+				URL.revokeObjectURL(element.objectUrl)
+			}
+			this.delete(id)
+		}
 	}
 
 	pause_audios() {
@@ -56,16 +76,18 @@ export class AudioManager extends Map<string, HTMLAudioElement> {
 	}
 
 	async play_audios() {
+		const promises: Promise<void>[] = []
 		for(const effect of this.compositor.currently_played_effects.values()) {
 			if(effect.kind === "audio") {
 				const element = this.get(effect.id)
 				if(element) {
 					const isMuted = isEffectMuted(effect)
 					element.muted = isMuted
-					await element.play()
+					promises.push(element.play().catch(e => console.error(e)))
 				}
 			}
 		}
+		await Promise.all(promises)
 	}
 
 	pause_audio(effect: AudioEffect) {

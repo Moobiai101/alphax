@@ -87,6 +87,9 @@ export class TextManager extends Map<string, {sprite: PIXIText, transformer: PIX
 	}
 
 	add_text_effect(effect: TextEffect, recreate?: boolean) {
+		if (this.has(effect.id)) {
+			this.cleanup_effect(effect.id)
+		}
 		const {rect, ...props} = effect
 		const style = new PIXI.TextStyle({
 			...props,
@@ -145,6 +148,23 @@ export class TextManager extends Map<string, {sprite: PIXIText, transformer: PIX
 		if(text) {
 			this.compositor.app.stage.removeChild(text.transformer)
 			this.compositor.app.stage.removeChild(text.sprite)
+		}
+	}
+
+	cleanup_effect(id: string) {
+		const text = this.get(id)
+		if(text) {
+			if(text.transformer.parent) {
+				text.transformer.parent.removeChild(text.transformer)
+			}
+			if(text.sprite.parent) {
+				text.sprite.parent.removeChild(text.sprite)
+			}
+			text.sprite.destroy({ children: true, texture: true, baseTexture: true })
+			if(!text.transformer.destroyed) {
+				text.transformer.destroy({ children: true })
+			}
+			this.delete(id)
 		}
 	}
 

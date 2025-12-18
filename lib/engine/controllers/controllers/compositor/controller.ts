@@ -16,6 +16,7 @@ import {AudioManager} from "./parts/audio-manager"
 console.log("[COMPOSITOR] AudioManager imported");
 import {VideoManager} from "./parts/video-manager"
 console.log("[COMPOSITOR] VideoManager imported");
+import {Decoder} from "../video-export/parts/decoder"
 import {FiltersManager} from "./parts/filter-manager"
 console.log("[COMPOSITOR] FiltersManager imported");
 import {AlignGuidelines} from "./lib/aligning_guidelines"
@@ -48,6 +49,7 @@ export interface Managers {
 	animationManager: AnimationManager
 	filtersManager: FiltersManager
 	transitionManager: TransitionManager
+	decoder: Decoder
 }
 
 export class Compositor {
@@ -109,7 +111,8 @@ export class Compositor {
 			audioManager: new AudioManager(this, actions),
 			animationManager: new AnimationManager(this, actions, "Animation"),
 			filtersManager: new FiltersManager(this, actions),
-			transitionManager: new TransitionManager(this, actions)
+			transitionManager: new TransitionManager(this, actions),
+			decoder: new Decoder(actions, omnislate.context.controllers.media, this)
 		}
 
 		// Don't start the animation frame loop here - wait for markReady() to be called
@@ -121,12 +124,12 @@ export class Compositor {
 				if(is_playing) {
 					this.managers.transitionManager.play(this.timecode)
 					this.managers.animationManager.play(this.timecode)
-					this.managers.videoManager.play_videos()
+					// this.managers.videoManager.play_videos() // Handled by decoder
 					this.managers.audioManager.play_audios()
 				} else {
 					this.managers.transitionManager.pause()
 					this.managers.animationManager.pause()
-					this.managers.videoManager.pause_videos()
+					// this.managers.videoManager.pause_videos() // Handled by decoder
 					this.managers.audioManager.pause_audios()
 				}
 			}
@@ -188,6 +191,7 @@ export class Compositor {
 			}
 		})
 		this.currently_played_effects.clear()
+		this.managers.decoder.reset()
 		this.app.renderer.clear()
 	}
 
@@ -212,7 +216,7 @@ export class Compositor {
 		return elapsed_time
 	}
 
-	compose_effects(effects: AnyEffect[], timecode: number, exporting?: boolean) {
+	async compose_effects(effects: AnyEffect[], timecode: number, exporting?: boolean) {
 		if(!this.#recreated) {
 			// console.log('[Compositor.compose_effects] Skipping - not recreated yet')
 			return
@@ -220,13 +224,8 @@ export class Compositor {
 		this.timecode = timecode
 		this.#update_currently_played_effects(effects, timecode, exporting)
 		
-		// Update video textures to show current frame
-		// This is critical for video playback - PIXI video textures need manual updates
-		// when autoPlay is disabled
-		this.managers.videoManager.update_video_textures()
-		
-		// console.log('[Compositor.compose_effects] Rendering at timecode:', timecode, 'currently_played_effects:', this.currently_played_effects.size, 'stage children:', this.app.stage.children.length)
-		this.app.render()
+		// Update video textures to show current frame (decoder handles rendering internally)
+		await this.managers.decoder.get_and_draw_decoded_frame(effects, timecode)
 	}
 
 	get_effect_current_time_relative_to_timecode(effect: AnyEffect, timecode: number) {
@@ -271,28 +270,24 @@ export class Compositor {
 	async seek(timecode: number, redraw?: boolean) {
 		this.managers.animationManager.seek(timecode)
 		this.managers.transitionManager.seek(timecode)
+		
+		const promises: Promise<unknown>[] = []
+
 		for(const effect of this.currently_played_effects.values()) {
 			if(effect.kind === "audio") {
 				const audio = this.managers.audioManager.get(effect.id)
-				if(!redraw && audio?.paused && this.#is_playing.value) {await audio.play()}
+				if(!redraw && audio?.paused && this.#is_playing.value) {
+					promises.push(audio.play().catch(e => console.error("Audio play failed during seek", e)))
+				}
 				if(redraw && timecode && audio) {
 					const current_time = this.get_effect_current_time_relative_to_timecode(effect, timecode)
 					audio.currentTime = current_time
-					await this.#onSeeked(audio)
+					promises.push(this.#onSeeked(audio))
 				}
 			}
-			if(effect.kind === "video") {
-				// Use the element directly from VideoEntry
-				const videoEntry = this.managers.videoManager.get(effect.id)
-				const element = videoEntry?.element
-				if(!redraw && element?.paused && this.#is_playing.value) {await element.play()}
-				if(redraw && timecode && element) {
-					const current_time = this.get_effect_current_time_relative_to_timecode(effect, timecode)
-					element.currentTime = current_time
-					await this.#onSeeked(element)
-				}
-			}
+			// Video seeking is handled by Decoder in compose_effects cycle
 		}
+		await Promise.all(promises)
 	}
 
 	#onSeeked(element: HTMLVideoElement | HTMLAudioElement) {
@@ -319,11 +314,7 @@ export class Compositor {
 			else if(effect.kind === "video") {
 				this.currently_played_effects.set(effect.id, effect)
 				this.managers.videoManager.add_video_to_canvas(effect)
-				// Use the element directly from VideoEntry
-				const videoEntry = this.managers.videoManager.get(effect.id)
-				if(videoEntry?.element) {
-					videoEntry.element.currentTime = effect.start / 1000
-				}
+				// VideoManager no longer handles play/seek directly; Decoder handles frame fetching
 			}
 			else if(effect.kind === "text") {
 				this.currently_played_effects.set(effect.id, effect)
@@ -332,7 +323,13 @@ export class Compositor {
 			else if(effect.kind === "audio") {
 				this.currently_played_effects.set(effect.id, effect)
 				const element = this.managers.audioManager.get(effect.id)
-				if(element) {element.currentTime = effect.start / 1000}
+				if(element) {
+					const current_time_in_effect = this.get_effect_current_time_relative_to_timecode(effect, this.timecode)
+					element.currentTime = current_time_in_effect
+					if (this.#is_playing.value) {
+						this.managers.audioManager.play_audio(effect).catch(e => console.error("Auto-play failed", e))
+					}
+				}
 			}
 		}
 		this.update_canvas_objects(omnislate.context.state)
@@ -427,6 +424,22 @@ export class Compositor {
 		await media.are_files_ready()
 		console.log('[Compositor.recreate] Starting recreate with', state.effects.length, 'effects')
 		console.log('[Compositor.recreate] Media controller has', media.size, 'files')
+
+		// Cleanup stale effects that are no longer in the state
+		const currentEffectIds = new Set(state.effects.map(e => e.id))
+		
+		for (const id of this.managers.videoManager.keys()) {
+			if (!currentEffectIds.has(id)) this.managers.videoManager.cleanup_effect(id)
+		}
+		for (const id of this.managers.imageManager.keys()) {
+			if (!currentEffectIds.has(id)) this.managers.imageManager.cleanup_effect(id)
+		}
+		for (const id of this.managers.textManager.keys()) {
+			if (!currentEffectIds.has(id)) this.managers.textManager.cleanup_effect(id)
+		}
+		for (const id of this.managers.audioManager.keys()) {
+			if (!currentEffectIds.has(id)) this.managers.audioManager.cleanup_effect(id)
+		}
 		
 		for(const effect of state.effects) {
 			if(effect.kind === "image") {
@@ -579,6 +592,11 @@ export class Compositor {
 		
 		// Clear currently played effects
 		this.currently_played_effects.clear()
+		
+		// Clean up decoder and its workers
+		if (this.managers?.decoder) {
+			this.managers.decoder.reset()
+		}
 		
 		// Clear on_playing subscribers by replacing the publisher
 		this.on_playing = pub()

@@ -11,7 +11,7 @@ import {Sprite as PIXISprite, Container as PIXIContainer} from "pixi.js"
 import * as PIXI from "pixi.js"
 // import {Transformer} from "pixi-transformer"
 
-export class ImageManager extends Map<string, {sprite: PIXISprite, transformer: PIXIContainer}> {
+export class ImageManager extends Map<string, {sprite: PIXISprite, transformer: PIXIContainer, objectUrl?: string}> {
 
 	constructor(private compositor: Compositor, private actions: Actions) {super()}
 
@@ -47,6 +47,9 @@ export class ImageManager extends Map<string, {sprite: PIXISprite, transformer: 
 	}
 
 	async add_image_effect(effect: ImageEffect, file: File, recreate?: boolean) {
+		if (this.has(effect.id)) {
+			this.cleanup_effect(effect.id)
+		}
 		const url = URL.createObjectURL(file)
 		const texture = await PIXI.Assets.load({src: url, format: file.type, loadParser: 'loadTextures'})
 		const sprite = new PIXI.Sprite(texture)
@@ -81,9 +84,29 @@ export class ImageManager extends Map<string, {sprite: PIXISprite, transformer: 
 			// this.compositor.app.stage.addChild(transformer)
 		})
 		;(sprite as any).effect = {...effect}
-		this.set(effect.id, {transformer, sprite})
+		this.set(effect.id, {transformer, sprite, objectUrl: url})
 		if (recreate) {return}
 		this.actions.add_image_effect(effect)
+	}
+
+	cleanup_effect(id: string) {
+		const image = this.get(id)
+		if(image) {
+			if(image.sprite.parent) {
+				image.sprite.parent.removeChild(image.sprite)
+			}
+			if(image.transformer.parent) {
+				image.transformer.parent.removeChild(image.transformer)
+			}
+			image.sprite.destroy({ children: true, texture: true, baseTexture: true })
+			if(!image.transformer.destroyed) {
+				image.transformer.destroy({ children: true })
+			}
+			if(image.objectUrl) {
+				URL.revokeObjectURL(image.objectUrl)
+			}
+			this.delete(id)
+		}
 	}
 
 	add_image_to_canvas(effect: ImageEffect) {
