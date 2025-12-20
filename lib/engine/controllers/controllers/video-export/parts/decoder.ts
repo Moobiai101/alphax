@@ -17,11 +17,11 @@ interface DecodedFrame {
 /**
  * FrameBuffer - Ring buffer for decoded video frames with LRU eviction
  * 
- * Key features:
- * - Stores frames by timestamp for O(1) lookup
- * - Auto-evicts old frames to prevent memory exhaustion
- * - Explicit frame.close() on eviction (critical for GPU memory)
- * - Tolerance-based lookup for frame timing flexibility
+ * PRODUCTION-GRADE IMPLEMENTATION (WebCodecs Best Practices):
+ * - Larger buffer size (5 seconds) for smooth playback
+ * - Proper frame.close() on eviction (critical for GPU memory)
+ * - Close frames after rendering to prevent memory leaks
+ * - More forgiving tolerance for frame timing
  */
 class FrameBuffer {
 	private frames = new Map<number, DecodedFrame>()
@@ -29,11 +29,11 @@ class FrameBuffer {
 	private maxSize: number
 	private tolerance: number // Frame lookup tolerance in ms
 
-	constructor(timebase: number, bufferSeconds: number = 2) {
-		// Buffer size = frames per second * seconds to buffer
+	constructor(timebase: number, bufferSeconds: number = 5) {
+		// Buffer size = frames per second * seconds to buffer (increased from 2 to 5)
 		this.maxSize = Math.ceil(timebase * bufferSeconds)
-		// Tolerance = half a frame duration
-		this.tolerance = (1000 / timebase) / 2
+		// Tolerance = 1.5x frame duration for more forgiving lookup
+		this.tolerance = (1000 / timebase) * 1.5
 	}
 
 	/**
@@ -103,6 +103,38 @@ class FrameBuffer {
 	}
 
 	/**
+	 * Close and remove a specific frame after rendering (CRITICAL for memory)
+	 */
+	closeFrame(timestamp: number): void {
+		// Find the actual frame key (may not be exact timestamp due to tolerance)
+		let frameKey: number | null = null
+		let closestDiff = Infinity
+
+		for (const ts of this.frames.keys()) {
+			const diff = Math.abs(ts - timestamp)
+			if (diff < closestDiff && diff <= this.tolerance) {
+				closestDiff = diff
+				frameKey = ts
+			}
+		}
+
+		if (frameKey !== null) {
+			const frame = this.frames.get(frameKey)
+			if (frame) {
+				try {
+					frame.frame.close() // CRITICAL: Release GPU memory after rendering
+				} catch (e) {
+					// Frame may already be closed
+				}
+				this.frames.delete(frameKey)
+				// Remove from insert order
+				const idx = this.insertOrder.indexOf(frameKey)
+				if (idx > -1) this.insertOrder.splice(idx, 1)
+			}
+		}
+	}
+
+	/**
 	 * Check if buffer has frames ready ahead of timestamp
 	 */
 	hasFramesAhead(timestamp: number, count: number = 5): boolean {
@@ -114,6 +146,18 @@ class FrameBuffer {
 			}
 		}
 		return false
+	}
+
+	/**
+	 * Get the range of buffered timestamps
+	 */
+	getBufferedRange(): { min: number, max: number } | null {
+		if (this.frames.size === 0) return null
+		const keys = [...this.frames.keys()]
+		return {
+			min: Math.min(...keys),
+			max: Math.max(...keys)
+		}
 	}
 
 	/**
@@ -144,20 +188,22 @@ interface EffectWorkerState {
 	buffer: FrameBuffer
 	isDecoding: boolean
 	lastRequestedTimestamp: number
+	effectEndTime: number // Track when the video ends
 }
 
 /**
  * Decoder - Production-grade video frame decoder with pre-buffering
  * 
- * Architecture:
+ * Architecture (Based on CapCut/Clipchamp patterns):
  * - One decode worker per video effect
- * - Pre-buffers frames ahead of playhead
+ * - Pre-buffers 5 seconds of frames ahead of playhead
  * - Non-blocking frame retrieval (returns null on miss)
- * - Proper memory management with frame.close()
+ * - Proper memory management with frame.close() after rendering
+ * - Continuous decoding - don't restart workers on cache miss
  */
 export class Decoder {
 	#effectStates = new Map<string, EffectWorkerState>()
-	#lastFramePerEffect = new Map<string, VideoFrame>() // Fallback for cache miss
+	#cacheMissCount = new Map<string, number>() // Track consecutive cache misses
 
 	constructor(
 		private actions: Actions,
@@ -169,16 +215,6 @@ export class Decoder {
 	 * Reset all decoder state
 	 */
 	reset(): void {
-		// Close all last frames
-		for (const frame of this.#lastFramePerEffect.values()) {
-			try {
-				frame.close()
-			} catch (e) {
-				// Ignore
-			}
-		}
-		this.#lastFramePerEffect.clear()
-
 		// Clean up all workers and buffers
 		for (const [effectId, state] of this.#effectStates) {
 			state.buffer.clear()
@@ -190,6 +226,7 @@ export class Decoder {
 			}
 		}
 		this.#effectStates.clear()
+		this.#cacheMissCount.clear()
 	}
 
 	/**
@@ -219,11 +256,13 @@ export class Decoder {
 				// Ignore
 			}
 			this.#effectStates.delete(effectId)
+			this.#cacheMissCount.delete(effectId)
 		}
 	}
 
 	/**
-	 * Handle seek - only restart decoding if new position is not in buffer
+	 * Handle seek - only restart decoding if seeking backward or far ahead
+	 * This prevents expensive worker restarts on every cache miss
 	 */
 	seek(effects: VideoEffect[], newTimestamp: number): void {
 		for (const effect of effects) {
@@ -237,17 +276,22 @@ export class Decoder {
 			// Calculate effect-relative timestamp
 			const effectTime = newTimestamp - effect.start_at_position + effect.start
 
-			// Check if timestamp is already in buffer
-			const frameInBuffer = state.buffer.get(effectTime)
-			if (frameInBuffer) {
-				// Position is already buffered, no need to restart
-				console.log(`[Decoder] Seek to ${effectTime}ms - already in buffer, skipping restart`)
-				continue
+			// Get buffered range
+			const range = state.buffer.getBufferedRange()
+
+			if (range) {
+				// Check if seeking within buffered range or slightly ahead (within 3 seconds)
+				if (effectTime >= range.min && effectTime <= range.max + 3000) {
+					console.log(`[Decoder] Seek to ${effectTime}ms - within/near buffer range [${range.min}ms - ${range.max}ms], continuing decode`)
+					// Reset cache miss counter since we might catch up
+					this.#cacheMissCount.set(effect.id, 0)
+					continue
+				}
 			}
 
-			console.log(`[Decoder] Seek to ${effectTime}ms - not in buffer, restarting worker`)
+			console.log(`[Decoder] Seek to ${effectTime}ms - out of buffer range, restarting worker`)
 
-			// Clear buffer
+			// Clear buffer and restart
 			state.buffer.clear()
 
 			// Terminate old worker
@@ -259,6 +303,7 @@ export class Decoder {
 			}
 
 			this.#effectStates.delete(effect.id)
+			this.#cacheMissCount.delete(effect.id)
 
 			// Start new worker from new position
 			this.#initWorkerForEffect(effect, newTimestamp)
@@ -266,8 +311,19 @@ export class Decoder {
 	}
 
 	/**
+	 * Check if buffer is ready for playback
+	 */
+	isBufferReady(effectId: string, timestamp: number, minFrames: number = 10): boolean {
+		const state = this.#effectStates.get(effectId)
+		if (!state) return false
+		return state.buffer.hasFramesAhead(timestamp, minFrames)
+	}
+
+	/**
 	 * Draw available frames for all effects at timestamp (NON-BLOCKING)
 	 * This is the main method called during playback
+	 * 
+	 * KEY CHANGE: Close frames after rendering to prevent memory leaks
 	 */
 	draw_available_frames(effects: AnyEffect[], timestamp: number): void {
 		const videoEffects = this.compositor.get_effects_relative_to_timecode(effects, timestamp)
@@ -294,17 +350,24 @@ export class Decoder {
 				// CACHE HIT - draw the frame
 				this.compositor.managers.videoManager.draw_decoded_frame(effect, frameData.frame)
 
-				// Store as last good frame (keep reference, don't close)
-				// We'll clone it for fallback storage
+				// CRITICAL: Close the frame after rendering to free GPU memory
+				// This is the key fix for the 1GB memory issue
+				state.buffer.closeFrame(effectTime)
+
 				anyFrameDrawn = true
+				// Reset cache miss counter on hit
+				this.#cacheMissCount.set(effect.id, 0)
 			} else {
-				// CACHE MISS - use last good frame if available (graceful degradation)
-				const lastFrame = this.#lastFramePerEffect.get(effect.id)
-				if (lastFrame) {
-					// Draw last good frame (holding previous frame)
-					// console.log(`[Decoder] Cache miss for ${effect.id} at ${effectTime}ms, using last frame`)
+				// CACHE MISS - track consecutive misses for potential worker restart
+				const currentMisses = (this.#cacheMissCount.get(effect.id) || 0) + 1
+				this.#cacheMissCount.set(effect.id, currentMisses)
+
+				// Only restart worker after many consecutive misses (not on first miss)
+				// This gives the decoder time to catch up
+				if (currentMisses > 30 && state.isDecoding) {
+					console.log(`[Decoder] Too many cache misses (${currentMisses}) for ${effect.id}, triggering seek`)
+					this.seek([effect], timestamp)
 				}
-				// Don't block - just continue, next frame may be ready
 			}
 		}
 
@@ -335,6 +398,8 @@ export class Decoder {
 			const frame = await this.#waitForFrame(state, effectTime, 5000)
 			if (frame) {
 				this.compositor.managers.videoManager.draw_decoded_frame(effect, frame.frame)
+				// Close frame after rendering for export too
+				state.buffer.closeFrame(effectTime)
 			}
 		}
 
@@ -369,14 +434,25 @@ export class Decoder {
 
 		const buffer = new FrameBuffer(this.compositor.timebase)
 
+		// Get transition info
+		const transition = this.compositor.managers.transitionManager.getTransitionByEffect(effect)
+		const { incoming, outgoing } = this.compositor.managers.transitionManager.getTransitionDurationPerEffect(transition, effect)
+
+		// Configure worker with effect parameters
+		// NOTE: effect.raw_duration is in SECONDS, but all other timestamps are in MILLISECONDS
+		const effectEnd = effect.end === effect.duration ? effect.raw_duration * 1000 : effect.end + outgoing
+		const effectStart = effect.start - incoming
+
 		const state: EffectWorkerState = {
 			worker,
 			buffer,
 			isDecoding: true,
-			lastRequestedTimestamp: startTimestamp
+			lastRequestedTimestamp: startTimestamp,
+			effectEndTime: effectEnd
 		}
 
 		this.#effectStates.set(effect.id, state)
+		this.#cacheMissCount.set(effect.id, 0)
 
 		// Handle worker errors
 		worker.addEventListener("error", (e) => {
@@ -399,20 +475,11 @@ export class Decoder {
 			}
 		})
 
-		// Get transition info
-		const transition = this.compositor.managers.transitionManager.getTransitionByEffect(effect)
-		const { incoming, outgoing } = this.compositor.managers.transitionManager.getTransitionDurationPerEffect(transition, effect)
-
 		const file = this.media.get(effect.file_hash)?.file
 		if (!file) {
 			console.error(`[Decoder] No file found for effect ${effect.id}`)
 			return
 		}
-
-		// Configure worker with effect parameters
-		// NOTE: effect.raw_duration is in SECONDS, but all other timestamps are in MILLISECONDS
-		const effectEnd = effect.end === effect.duration ? effect.raw_duration * 1000 : effect.end + outgoing
-		const effectStart = effect.start - incoming
 
 		// Calculate the actual seek position within the video file
 		// startTimestamp is the timeline position, we need to convert to effect-relative position

@@ -61,9 +61,11 @@ export async function demuxer(
 }
 
 function calculateDynamicDelay(queueSize: number) {
-	const queueLimit = 500
-	const maxDelay = 100 // Maximum delay in milliseconds
-	const minDelay = 0   // Minimum delay in milliseconds
+	// OPTIMIZED: Lower threshold and faster response for realtime playback
+	// Based on WebCodecs best practices for continuous streaming
+	const queueLimit = 100  // Reduced from 500 for faster backpressure response
+	const maxDelay = 50     // Reduced from 100ms for faster decoding
+	const minDelay = 0      // No delay when queue is empty
 	const delay = (queueSize / queueLimit) * maxDelay;
 	return Math.min(maxDelay, Math.max(minDelay, delay));
 }

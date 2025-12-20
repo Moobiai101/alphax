@@ -1,3 +1,11 @@
+/**
+ * Decode Worker - Hardware-accelerated video frame decoder
+ * 
+ * PRODUCTION-GRADE IMPLEMENTATION (WebCodecs Best Practices):
+ * - Hardware acceleration enabled for GPU decoding
+ * - Proper state reset on new decode session
+ * - Continuous streaming until end of file
+ */
 
 let timestamp = 0
 let start = 0
@@ -9,6 +17,9 @@ let timestamp_end = 0
 let lastProcessedTimestamp = 0
 let timebaseInMicroseconds = 1000 / 25 * 1000
 
+// Track if decoder is configured
+let isConfigured = false
+
 const decoder = new VideoDecoder({
 	output(frame) {
 		const frameTimestamp = frame.timestamp / 1000
@@ -19,7 +30,7 @@ const decoder = new VideoDecoder({
 
 		processFrame(frame, timebaseInMicroseconds)
 	},
-	error: (e) => console.log(e)
+	error: (e) => console.error("[DecodeWorker] Decoder error:", e)
 })
 
 let endSent = false
@@ -37,6 +48,7 @@ decoder.addEventListener("dequeue", () => {
 
 self.addEventListener("message", async message => {
 	if (message.data.action === "demux") {
+		// Reset all state for new decode session (CRITICAL)
 		timestamp = message.data.starting_timestamp
 		timebase = message.data.timebase
 		timebaseInMicroseconds = 1000 / timebase * 1000
@@ -44,25 +56,59 @@ self.addEventListener("message", async message => {
 		end = message.data.props.end
 		id = message.data.props.id
 		timestamp_end = (message.data.starting_timestamp) + (message.data.props.end - message.data.props.start)
+
+		// Reset processing state
+		lastProcessedTimestamp = 0
+		endSent = false
+		isConfigured = false
+
+		console.log(`[DecodeWorker] Starting decode session for ${id}: start=${start}ms, end=${end}ms, timestamp_end=${timestamp_end}ms`)
 	}
 	if (message.data.action === "configure") {
-		// Add optimizeForLatency for realtime playback (industry standard)
-		const config = {
+		// Enable hardware acceleration for GPU-accelerated decoding (industry standard)
+		const config: VideoDecoderConfig = {
 			...message.data.config,
-			optimizeForLatency: true
+			optimizeForLatency: true,
+			hardwareAcceleration: "prefer-hardware"
 		}
-		decoder.configure(config)
-		await decoder.flush()
+
+		try {
+			decoder.configure(config)
+			await decoder.flush()
+			isConfigured = true
+			console.log(`[DecodeWorker] Decoder configured with hardware acceleration`)
+		} catch (e) {
+			console.error("[DecodeWorker] Failed to configure decoder:", e)
+		}
 	}
 	if (message.data.action === "chunk") {
-		decoder.decode(message.data.chunk)
+		if (!isConfigured) {
+			console.warn("[DecodeWorker] Received chunk before configuration, ignoring")
+			return
+		}
+		try {
+			decoder.decode(message.data.chunk)
+		} catch (e) {
+			console.error("[DecodeWorker] Failed to decode chunk:", e)
+		}
 	}
 	if (message.data.action === "eof") {
-		await decoder.flush()
-		self.postMessage({ action: "end" })
+		try {
+			await decoder.flush()
+		} catch (e) {
+			console.error("[DecodeWorker] Flush error:", e)
+		}
+		if (!endSent) {
+			endSent = true
+			self.postMessage({ action: "end" })
+		}
 	}
 	if (message.data.action === "cleanup") {
-		decoder.close()
+		try {
+			decoder.close()
+		} catch (e) {
+			// Decoder may already be closed
+		}
 		clearInterval(interval)
 	}
 })
@@ -71,9 +117,12 @@ self.addEventListener("message", async message => {
 * -- processFrame --
 * Function responsible for maintaining
 * video framerate to desired timebase
+* 
+* IMPROVED: Better frame timing logic
 */
 
 function processFrame(currentFrame: VideoFrame, targetFrameInterval: number) {
+	// First frame initialization
 	if (lastProcessedTimestamp === 0) {
 		self.postMessage({
 			action: "new-frame",
@@ -84,10 +133,12 @@ function processFrame(currentFrame: VideoFrame, targetFrameInterval: number) {
 			}
 		})
 		timestamp += 1000 / timebase
-		lastProcessedTimestamp += currentFrame.timestamp
+		lastProcessedTimestamp = currentFrame.timestamp
+		return
 	}
 
-	// if met frame is duplicated
+	// Handle frame duplication for variable framerate videos
+	// If current frame is ahead of where we should be, output multiple frames
 	while (currentFrame.timestamp >= lastProcessedTimestamp + targetFrameInterval) {
 		self.postMessage({
 			action: "new-frame",
@@ -102,7 +153,7 @@ function processFrame(currentFrame: VideoFrame, targetFrameInterval: number) {
 		lastProcessedTimestamp += targetFrameInterval
 	}
 
-	// if not met frame is skipped
+	// Output current frame if it's at or past expected position
 	if (currentFrame.timestamp >= lastProcessedTimestamp) {
 		self.postMessage({
 			action: "new-frame",
@@ -117,5 +168,6 @@ function processFrame(currentFrame: VideoFrame, targetFrameInterval: number) {
 		lastProcessedTimestamp += targetFrameInterval
 	}
 
+	// CRITICAL: Close frame after processing to release GPU memory
 	currentFrame.close()
 }
