@@ -1,5 +1,5 @@
 console.log("[DEMUXER] Module loading started");
-import {WebDemuxer} from "web-demuxer"
+import { WebDemuxer } from "web-demuxer/dist/web-demuxer.js"
 console.log("[DEMUXER] WebDemuxer imported");
 
 export async function demuxer(
@@ -11,6 +11,7 @@ export async function demuxer(
 	end?: number
 ) {
 	let queue = 0
+	let packetCount = 0
 	const webdemuxer = new WebDemuxer({
 		// ⚠️ you need to put the dist/wasm-files file in the npm package into a static directory like public
 		// making sure that the js and wasm in wasm-files are in the same directory
@@ -26,33 +27,48 @@ export async function demuxer(
 		* also ending demuxing one second later just in case too
 	*/
 	const oneSecondOffset = 1000
-	const reader = webdemuxer.readAVPacket(start ? (start - oneSecondOffset) / 1000 : undefined, end ? (end + oneSecondOffset) / 1000 : undefined).getReader()
+	const startSeconds = start ? (start - oneSecondOffset) / 1000 : undefined
+	const endSeconds = end ? (end + oneSecondOffset) / 1000 : undefined
+	console.log(`[Demuxer] Reading packets from ${startSeconds}s to ${endSeconds}s (${start}ms to ${end}ms)`)
+
+	const reader = webdemuxer.readAVPacket(startSeconds, endSeconds).getReader()
 
 	encoderWorker.addEventListener("message", (msg) => {
-		if(msg.data.action === "dequeue") {
+		if (msg.data.action === "dequeue") {
 			queue = msg.data.size
 		}
 	})
 
-	reader.read().then(async function processAVPacket({ done, value }): Promise<any> {
-		if (done) {return}
-		const delay = calculateDynamicDelay(queue)
-		const videoChunk = webdemuxer.genEncodedVideoChunk(value)
-		onChunk(videoChunk)
-		await sleep(delay)
-		return await reader.read().then(processAVPacket)
+	return new Promise<void>((resolve, reject) => {
+		reader.read().then(async function processAVPacket({ done, value }): Promise<any> {
+			if (done) {
+				console.log(`[Demuxer] Finished reading ${packetCount} packets`)
+				resolve()
+				return
+			}
+			try {
+				packetCount++
+				const delay = calculateDynamicDelay(queue)
+				const videoChunk = webdemuxer.genEncodedVideoChunk(value)
+				onChunk(videoChunk)
+				await sleep(delay)
+				return await reader.read().then(processAVPacket)
+			} catch (e) {
+				reject(e)
+			}
+		}).catch(reject)
 	})
 }
 
-	function calculateDynamicDelay(queueSize: number) {
-		const queueLimit = 500
-		const maxDelay = 100 // Maximum delay in milliseconds
-		const minDelay = 0   // Minimum delay in milliseconds
-		const delay = (queueSize / queueLimit) * maxDelay;
-		return Math.min(maxDelay, Math.max(minDelay, delay));
-	}
+function calculateDynamicDelay(queueSize: number) {
+	const queueLimit = 500
+	const maxDelay = 100 // Maximum delay in milliseconds
+	const minDelay = 0   // Minimum delay in milliseconds
+	const delay = (queueSize / queueLimit) * maxDelay;
+	return Math.min(maxDelay, Math.max(minDelay, delay));
+}
 
-	function sleep(ms: number) {
-		return new Promise(resolve => setTimeout(resolve, ms));
-	}
+function sleep(ms: number) {
+	return new Promise(resolve => setTimeout(resolve, ms));
+}
 

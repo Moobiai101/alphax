@@ -77,7 +77,7 @@ export class VideoManager extends Map<string, VideoEntry> {
 		canvas.height = effect.rect.height
 		canvas.getContext("2d")!.imageSmoothingEnabled = false
 		this.#effect_canvas.set(effect.id, canvas)
-
+		
 		// Create initial texture from black canvas or placeholder
 		const texture = Texture.from(canvas)
 		this.#videoElements.set(effect.id, texture)
@@ -190,8 +190,8 @@ export class VideoManager extends Map<string, VideoEntry> {
 			
 			// Resize canvas if needed (if frame size changed)
 			if (canvas.width !== videoEntry.sprite.width || canvas.height !== videoEntry.sprite.height) {
-				canvas.width = videoEntry.sprite.width
-				canvas.height = videoEntry.sprite.height
+			canvas.width = videoEntry.sprite.width
+			canvas.height = videoEntry.sprite.height
 			}
 			
 			canvas.getContext("2d")!.drawImage(frame, 0, 0, videoEntry.sprite.width, videoEntry.sprite.height)
